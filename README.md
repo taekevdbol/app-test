@@ -1,1 +1,1 @@
-# v3.5: rij-uitklap + tabelbewerken zonder status/created_at
+# v3.7: AG Grid detail met data URIs (geen 'bestand niet gevonden') + auto-rerun na fotowijziging
