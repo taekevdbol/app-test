@@ -51,6 +51,7 @@ def executemany(q, seq):
     with closing(get_conn()) as conn:
         c = conn.cursor(); c.executemany(q, seq); conn.commit()
 
+# ---------- Helpers ----------
 def to_data_uri(path):
     if not path or not os.path.exists(path): return None
     mime, _ = mimetypes.guess_type(path)
@@ -79,6 +80,14 @@ def normalize_type(val):
     m = {"thuis":"Thuis","home":"Thuis","uit":"Uit","away":"Uit","derde":"Derde","third":"Derde","3e":"Derde","keepers":"Keepers","gk":"Keepers","special":"Special"}
     return m.get(s, s.title())
 
+def norm_yesno(v):
+    s = str(v).strip().lower()
+    return "Ja" if s in ("ja","yes","y","true","1") else "Nee"
+
+def norm_status(v):
+    s = str(v).strip().lower()
+    return "Verkocht" if s in ("verkocht","sold") else "Actief"
+
 def get_setting(key, default=None):
     df = load_df("SELECT value FROM settings WHERE key=?", (key,))
     if df.empty: return default
@@ -96,19 +105,63 @@ def save_uploaded_file(uploaded_file):
     with open(out, "wb") as f: f.write(uploaded_file.getbuffer())
     return out
 
+# --- Wishlist sync ---
+def remove_from_wishlist_if_present(club:str, seizoen:str, typ:str):
+    """Verwijder overeenkomstige wens (club+seizoen, type exact of leeg)."""
+    c = club.strip().lower()
+    s = seizoen.strip().lower()
+    t = normalize_type(typ)
+    # Haal rijen op en filter in Python om te voorkomen dat lege/NULL type anders matcht
+    df = load_df("SELECT id, club, seizoen, type FROM wishlist")
+    if df.empty: return 0
+    df["_c"]=df["club"].str.strip().str.lower()
+    df["_s"]=df["seizoen"].astype(str).str.strip().str.lower()
+    df["_t"]=df["type"].fillna("").astype(str).str.strip()
+    mask=(df["_c"]==c) & (df["_s"]==s) & ((df["_t"]=="") | (df["_t"].str.lower()==(t or "").lower()))
+    ids=df.loc[mask, "id"].tolist()
+    if ids:
+        q = "DELETE FROM wishlist WHERE id IN (%s)" % ",".join("?"*len(ids))
+        execute(q, ids)
+    return len(ids)
+
+def bulk_cleanup_wishlist_against_collection():
+    """Verwijder alle wensen die in de collectie zitten (actief of verkocht)."""
+    dfw = load_df("SELECT id, club, seizoen, type FROM wishlist")
+    if dfw.empty: return 0
+    dsh = load_df("SELECT club,seizoen,type FROM shirts")
+    if dsh.empty: return 0
+    dfw["_c"]=dfw["club"].str.strip().str.lower()
+    dfw["_s"]=dfw["seizoen"].astype(str).str.strip().str.lower()
+    dfw["_t"]=dfw["type"].fillna("").astype(str).str.strip().str.lower()
+    dsh["_c"]=dsh["club"].str.strip().str.lower()
+    dsh["_s"]=dsh["seizoen"].astype(str).str.strip().str.lower()
+    dsh["_t"]=dsh["type"].fillna("").astype(str).str.strip().str.lower()
+    exist_exact = set((a,b,c) for a,b,c in zip(dsh["_c"], dsh["_s"], dsh["_t"]))
+    exist_any   = set((a,b)   for a,b   in zip(dsh["_c"], dsh["_s"]))
+    to_del=[]
+    for _,r in dfw.iterrows():
+        key_exact=(r["_c"],r["_s"],r["_t"])
+        key_any=(r["_c"],r["_s"])
+        if (r["_t"]=="" and key_any in exist_any) or (r["_t"]!="" and key_exact in exist_exact):
+            to_del.append(int(r["id"]))
+    if to_del:
+        q="DELETE FROM wishlist WHERE id IN (%s)" % ",".join("?"*len(to_del))
+        execute(q, to_del)
+    return len(to_del)
+
 # ---------- UI ----------
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide")
 init_db()
-st.title("⚽ Shirt Collectie — v5.2.8 (scrollbare tabel + kleine inline vergroting)")
+st.title("⚽ Shirt Collectie — v5.3.0 (wishlist-auto‑clean + bewerkmodus)")
 
 TYPES = ["Thuis","Uit","Derde","Keepers","Special"]
 MAATEN = ["Kids XS","Kids S","Kids M","Kids L","XS","S","M","L","XL","XXL","XXXL"]
 
-tabs = st.tabs(["➕ Shirt toevoegen","📚 Collectie (klik foto)","⭐ Wenslijst & Missende shirts","💸 Verkoop & Budget","⬇️⬆️ Import / Export"])
+tabs = st.tabs(["➕ Shirt toevoegen","📚 Collectie (klik foto & bewerken)","⭐ Wenslijst & Missende shirts","💸 Verkoop & Budget","⬇️⬆️ Import / Export"])
 
 # TAB 1
 with tabs[0]:
-    st.subheader("➕ Nieuw shirt toevoegen")
+    st.subheader("➕ Nieuw shirt toevoegen (verwijdert automatisch uit wenslijst)")
     with st.form("add", clear_on_submit=True):
         c1,c2,c3 = st.columns(3)
         club = c1.text_input("Club*","Ajax"); seizoen = c2.text_input("Seizoen*","1995/96"); maat = c3.selectbox("Maat*", MAATEN, index=7)
@@ -121,11 +174,16 @@ with tabs[0]:
             execute("""INSERT INTO shirts (club,seizoen,type,maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info,status,created_at)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (club.strip(), seizoen.strip(), tsel, maat, bedr.strip(), serie.strip(), zelf, float(prijs), extra.strip(), "Actief", datetime.utcnow().isoformat()))
-            st.success("Shirt toegevoegd.")
+            removed = remove_from_wishlist_if_present(club, seizoen, tsel)
+            if removed:
+                st.success(f"Shirt toegevoegd en {removed} wens(en) verwijderd.")
+            else:
+                st.success("Shirt toegevoegd. (Geen match gevonden in wenslijst)")
 
 # TAB 2
 with tabs[1]:
-    st.subheader("📚 Klik op de foto (tabel blijft vol in beeld; scrollt indien nodig)")
+    st.subheader("📚 Collectie — klik foto om te vergroten | zet **Bewerk modus** aan om cellen aan te passen")
+    edit_mode = st.toggle("✏️ Bewerk modus", value=False, help="Zet aan om teksten aan te passen. Klik daarna op 'Opslaan wijzigingen'.")
 
     df = load_df("SELECT * FROM shirts")
     if df.empty:
@@ -152,15 +210,14 @@ with tabs[1]:
         dfv["thumb"]=thumbs; dfv["gallery_urls"]=galleries
         dfv["_expanded"] = False
 
-        show = ["thumb","id","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","gallery_urls","_expanded"]
-        gdf = dfv[show].copy()
+        show_cols = ["thumb","id","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","status","gallery_urls","_expanded"]
+        gdf = dfv[show_cols].copy()
+        orig_edit = dfv[["id","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","status"]].copy()
 
         go = GridOptionsBuilder.from_dataframe(gdf)
         go.configure_selection("single")
-        # FIX: not autoHeight; table gets a fixed height and scrolls
         go.configure_grid_options(domLayout='normal')
-
-        # Small expand
+        # Row heights for inline photo strip
         get_row_height = JsCode("""
         function(params){
           if (params && params.data && params.data._expanded){ return 160; }
@@ -168,6 +225,7 @@ with tabs[1]:
         }""")
         go.configure_grid_options(getRowHeight=get_row_height)
 
+        # Foto renderer as before (collapsed=thumb, expanded=strip)
         renderer = JsCode("""
         class InlinePhotoRenderer {
           init(p){
@@ -228,15 +286,64 @@ with tabs[1]:
         go.configure_column("gallery_urls", hide=True)
         go.configure_column("_expanded", hide=True)
 
+        # Editable columns (in edit_mode)
+        editable_cols = ["club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","status"]
+        for col in editable_cols:
+            if col in ["type"]:
+                go.configure_column(col, editable=edit_mode, cellEditor="agSelectCellEditor", cellEditorParams={"values": TYPES})
+            elif col in ["zelf_gekocht"]:
+                go.configure_column(col, editable=edit_mode, cellEditor="agSelectCellEditor", cellEditorParams={"values": ["Ja","Nee"]})
+            elif col in ["status"]:
+                go.configure_column(col, editable=edit_mode, cellEditor="agSelectCellEditor", cellEditorParams={"values": ["Actief","Verkocht"]})
+            else:
+                go.configure_column(col, editable=edit_mode)
+
         grid = AgGrid(
             gdf, gridOptions=go.build(),
-            update_mode=GridUpdateMode.SELECTION_CHANGED,
-            data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+            update_mode=GridUpdateMode.VALUE_CHANGED | GridUpdateMode.SELECTION_CHANGED,
+            data_return_mode=DataReturnMode.AS_INPUT,
             fit_columns_on_grid_load=True, allow_unsafe_jscode=True, enable_enterprise_modules=True,
-            height=560  # fixed height -> grid scrolls; other rows remain visible
+            height=560
         )
 
-        # Small photo actions panel, collapsed by default
+        # SAVE edits
+        changed = False
+        new_df = pd.DataFrame(grid["data"])
+        if edit_mode and not new_df.empty:
+            new_edit = new_df[["id"]+editable_cols].copy()
+            # Compare row-by-row
+            updates=0
+            for _, nr in new_edit.iterrows():
+                oid = int(nr["id"])
+                orow = orig_edit[orig_edit["id"]==oid]
+                if orow.empty: continue
+                orow = orow.iloc[0].to_dict()
+                # Build delta
+                delta={}
+                for col in editable_cols:
+                    nv = nr[col]
+                    if col=="type": nv = normalize_type(nv)
+                    if col=="zelf_gekocht": nv = norm_yesno(nv)
+                    if col=="status": nv = norm_status(nv)
+                    if col=="aanschaf_prijs":
+                        try: nv = float(nv)
+                        except: nv = orow[col]
+                    ov = orow[col]
+                    if (pd.isna(nv) and pd.isna(ov)) or (nv==ov):
+                        continue
+                    delta[col]=nv
+                if delta:
+                    sets=", ".join([f"{k}=?" for k in delta.keys()])
+                    params=list(delta.values())+[oid]
+                    execute(f"UPDATE shirts SET {sets} WHERE id=?", params)
+                    updates += 1
+            if updates>0:
+                st.success(f"{updates} rij(en) opgeslagen.")
+                changed = True
+        if changed:
+            st.experimental_rerun()
+
+        # Compacte foto‑acties onder de grid
         sel = grid["selected_rows"]
         if sel:
             rid = int(sel[0]["id"])
@@ -277,16 +384,24 @@ with tabs[1]:
                                 n+=1
                         st.success(f"{n} foto('s) toegevoegd."); st.experimental_rerun()
 
-# TAB 3 (unchanged)
+# TAB 3
 with tabs[2]:
     st.subheader("⭐ Wenslijst")
-    with st.form("add_wish", clear_on_submit=True):
-        c1,c2,c3,c4 = st.columns(4)
-        club=c1.text_input("Club*","Ajax"); seizoen=c2.text_input("Seizoen*","1995/96"); t=c3.selectbox("Type (optioneel)", ["",*TYPES], index=0); opm=c4.text_input("Opmerking","")
-        if st.form_submit_button("➕ Toevoegen"):
-            tnorm = normalize_type(t) if t else None
-            execute("INSERT INTO wishlist (club,seizoen,type,opmerking) VALUES (?,?,?,?)", (club.strip(), seizoen.strip(), tnorm, opm.strip()))
-            st.success("Wens toegevoegd.")
+    left, right = st.columns([3,1])
+    with left:
+        with st.form("add_wish", clear_on_submit=True):
+            c1,c2,c3,c4 = st.columns(4)
+            club=c1.text_input("Club*","Ajax"); seizoen=c2.text_input("Seizoen*","1995/96"); t=c3.selectbox("Type (optioneel)", ["",*TYPES], index=0); opm=c4.text_input("Opmerking","")
+            if st.form_submit_button("➕ Toevoegen"):
+                tnorm = normalize_type(t) if t else None
+                execute("INSERT INTO wishlist (club,seizoen,type,opmerking) VALUES (?,?,?,?)", (club.strip(), seizoen.strip(), tnorm, opm.strip()))
+                st.success("Wens toegevoegd.")
+    with right:
+        if st.button("🧹 Opschonen t.o.v. collectie"):
+            n = bulk_cleanup_wishlist_against_collection()
+            if n>0: st.success(f"{n} wens(en) verwijderd omdat ze in de collectie zitten.")
+            else: st.info("Geen overeenkomsten gevonden.")
+
     dfw = load_df("SELECT * FROM wishlist")
     if not dfw.empty:
         st.dataframe(dfw, use_container_width=True, hide_index=True)
@@ -311,9 +426,9 @@ with tabs[2]:
         if not missing.empty:
             st.dataframe(missing, use_container_width=True, hide_index=True)
         else:
-            st.success("Alles van je wenslijst zit al in je actieve collectie.")
+            st.success("Alles van je wenslijst zit al in je collectie.")
 
-# TAB 4 (unchanged)
+# TAB 4 en 5 blijven zoals in v5.2.8
 with tabs[3]:
     st.subheader("💸 Verkoop & Budget")
     colA,colB=st.columns([1,2])
@@ -340,7 +455,6 @@ with tabs[3]:
                 execute("UPDATE shirts SET status='Verkocht' WHERE id=?", (int(row["id"]),))
                 st.success(f"Verkoop geregistreerd. Winst: € {winst:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
 
-# TAB 5 (import/export)
 with tabs[4]:
     st.subheader("⬇️⬆️ Import / Export")
     col1,col2=st.columns(2)
@@ -367,7 +481,7 @@ with tabs[4]:
                     str(r[colmap["club"]]).strip(), str(r[colmap["seizoen"]]).strip(),
                     normalize_type(str(r[colmap["type"]]).strip()) if type_present and pd.notna(r[colmap["type"]]) else "Thuis",
                     str(r[colmap["maat"]]).strip(), str(r[colmap["bedrukking"]]).strip(), str(r[colmap["serienummer"]]).strip(),
-                    "Ja" if str(r[colmap["zelf_gekocht"]]).strip().lower() in ("ja","yes","true","1") else "Nee",
+                    norm_yesno(r[colmap["zelf_gekocht"]]),
                     float(r[colmap["aanschaf_prijs"]]), "" if pd.isna(r[colmap["extra_info"]]) else str(r[colmap["extra_info"]]).strip(),
                     "Actief" if (not status_present or pd.isna(r[colmap["status"]])) else str(r[colmap["status"]]).strip(), datetime.utcnow().isoformat()
                 ))
