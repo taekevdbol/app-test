@@ -3,9 +3,8 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, date
 import os
-import io
 
 DB_PATH = "shirts.db"
 IMAGES_DIR = "images"
@@ -27,6 +26,7 @@ def init_db():
             aanschaf_prijs REAL NOT NULL,
             extra_info TEXT,
             foto_path TEXT,
+            status TEXT NOT NULL DEFAULT 'Actief',
             created_at TEXT NOT NULL
         )
         """)
@@ -39,11 +39,32 @@ def init_db():
             opmerking TEXT
         )
         """)
-        cols = {row[1] for row in c.execute("PRAGMA table_info(shirts)").fetchall()}
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shirt_id INTEGER NOT NULL,
+            verkoop_datum TEXT NOT NULL,
+            verkoop_prijs REAL NOT NULL,
+            verkoop_kosten REAL NOT NULL DEFAULT 0.0,
+            winst REAL NOT NULL,
+            koper TEXT,
+            opmerking TEXT,
+            FOREIGN KEY (shirt_id) REFERENCES shirts(id)
+        )
+        """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+        cols = {row[1]: row for row in c.execute("PRAGMA table_info(shirts)").fetchall()}
         if "type" not in cols:
             c.execute("ALTER TABLE shirts ADD COLUMN type TEXT NOT NULL DEFAULT 'Thuis'")
         if "foto_path" not in cols:
             c.execute("ALTER TABLE shirts ADD COLUMN foto_path TEXT")
+        if "status" not in cols:
+            c.execute("ALTER TABLE shirts ADD COLUMN status TEXT NOT NULL DEFAULT 'Actief'")
         conn.commit()
 
 def get_conn():
@@ -90,12 +111,31 @@ def save_uploaded_file(uploaded_file):
         f.write(uploaded_file.getbuffer())
     return out_path
 
+def get_setting(key, default=None):
+    df = load_df("SELECT value FROM settings WHERE key=?", (key,))
+    if df.empty:
+        return default
+    return df.iloc[0]["value"]
+
+def set_setting(key, value):
+    if get_setting(key) is None:
+        execute("INSERT INTO settings (key, value) VALUES (?,?)", (key, str(value)))
+    else:
+        execute("UPDATE settings SET value=? WHERE key=?", (str(value), key))
+
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide", initial_sidebar_state="collapsed")
 init_db()
 
-st.title("⚽ Shirt Collectie — Taeke")
+st.title("⚽ Shirt Collectie — Taeke (v3)")
 
-tabs = st.tabs(["➕ Shirt toevoegen", "📚 Alle shirts", "⭐ Wenslijst & Missende shirts", "⬇️⬆️ Import / Export", "ℹ️ Uitleg"])
+tabs = st.tabs([
+    "➕ Shirt toevoegen",
+    "📚 Alle shirts",
+    "⭐ Wenslijst & Missende shirts",
+    "💸 Verkoop & Budget",
+    "⬇️⬆️ Import / Export",
+    "ℹ️ Uitleg"
+])
 
 TYPES = ["Thuis","Uit","Derde","Keepers","Special"]
 MAATEN = ["Kids XS","Kids S","Kids M","Kids L","XS","S","M","L","XL","XXL","XXXL"]
@@ -124,9 +164,9 @@ with tabs[0]:
             else:
                 foto_path = save_uploaded_file(foto)
                 execute(
-                    """INSERT INTO shirts (club,seizoen,type,maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info,foto_path,created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                    (club.strip(), seizoen.strip(), type_sel, maat, bedrukking.strip(), serienummer.strip(), zelf_gekocht, float(aanschaf_prijs), extra_info.strip(), foto_path, datetime.utcnow().isoformat())
+                    """INSERT INTO shirts (club,seizoen,type,maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info,foto_path,status,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (club.strip(), seizoen.strip(), type_sel, maat, bedrukking.strip(), serienummer.strip(), zelf_gekocht, float(aanschaf_prijs), extra_info.strip(), foto_path, "Actief", datetime.utcnow().isoformat())
                 )
                 execute("""DELETE FROM wishlist WHERE LOWER(club)=LOWER(?) AND LOWER(seizoen)=LOWER(?) AND (type IS NULL OR TRIM(type)='' OR LOWER(type)=LOWER(?))""",
                         (club.strip(), seizoen.strip(), type_sel))
@@ -138,12 +178,13 @@ with tabs[1]:
     if df.empty:
         st.info("Nog geen shirts in de database. Voeg je eerste shirt toe op het tabblad **Shirt toevoegen**.")
     else:
-        f1, f2, f3, f4, f5 = st.columns(5)
+        f1, f2, f3, f4, f5, f6 = st.columns(6)
         f_club = f1.text_input("Filter op club")
         f_seizoen = f2.text_input("Filter op seizoen")
         f_type = f3.multiselect("Filter op type", TYPES)
         f_maat = f4.multiselect("Filter op maat", sorted(df["maat"].unique().tolist()))
         f_zelf = f5.multiselect("Filter op zelf gekocht", ["Ja","Nee"])
+        f_status = f6.multiselect("Status", ["Actief","Verkocht"], default=["Actief","Verkocht"])
 
         mask = pd.Series(True, index=df.index)
         if f_club:
@@ -156,13 +197,15 @@ with tabs[1]:
             mask &= df["maat"].isin(f_maat)
         if f_zelf:
             mask &= df["zelf_gekocht"].isin(f_zelf)
+        if f_status:
+            mask &= df["status"].isin(f_status)
         df_f = df[mask].copy()
 
         df_f["seizoen_start"] = df_f["seizoen"].apply(parse_season_start)
-        df_f.sort_values(by=["club","seizoen_start","type"], ascending=[True, False, True], inplace=True)
+        df_f.sort_values(by=["status","club","seizoen_start","type"], ascending=[True, True, False, True], inplace=True)
         df_f.drop(columns=["seizoen_start"], inplace=True)
 
-        show_cols = ["id","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","foto_path","created_at"]
+        show_cols = ["id","status","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","foto_path","created_at"]
         st.dataframe(df_f[show_cols], use_container_width=True, hide_index=True)
 
         with st.expander("🖼️ Toon foto's van gefilterde resultaten"):
@@ -179,8 +222,8 @@ with tabs[1]:
                             st.image(p, caption=f'{row["club"]} {row["seizoen"]} • {row["type"]} • {row["maat"]}', use_column_width=True)
                         i += 1
 
-        with st.expander("Verwijderen / Bewerken"):
-            colA, colB = st.columns(2)
+        with st.expander("Verwijderen / Bewerken / Status"):
+            colA, colB, colC = st.columns(3)
             del_id = colA.number_input("Verwijder shirt met ID", min_value=0, step=1)
             if colA.button("Verwijder", type="primary"):
                 if del_id and int(del_id) in df["id"].values:
@@ -200,23 +243,23 @@ with tabs[1]:
             new_price = colB.number_input("Nieuwe prijs (€)", min_value=0.0, step=1.0, format="%.2f")
             new_info  = colB.text_input("Nieuwe extra info")
             new_type  = colB.selectbox("Nieuw type", ["(geen wijziging)"] + TYPES, index=0)
-            new_photo = colB.file_uploader("Nieuwe foto (optioneel) – vervangt bestaande", type=["jpg","jpeg","png"], key="reupload")
             if colB.button("Opslaan wijzigingen"):
                 if edit_id and int(edit_id) in df["id"].values:
-                    # Current values
                     current = df[df["id"]==int(edit_id)].iloc[0]
-                    foto_path = current["foto_path"]
                     update_type = current["type"] if new_type == "(geen wijziging)" else new_type
-                    if new_photo is not None:
-                        try:
-                            if foto_path and os.path.exists(foto_path):
-                                os.remove(foto_path)
-                        except Exception:
-                            pass
-                        foto_path = save_uploaded_file(new_photo)
-                    execute("UPDATE shirts SET aanschaf_prijs=?, extra_info=?, type=?, foto_path=? WHERE id=?",
-                            (float(new_price), new_info, update_type, foto_path, int(edit_id)))
+                    execute("UPDATE shirts SET aanschaf_prijs=?, extra_info=?, type=? WHERE id=?",
+                            (float(new_price), new_info, update_type, int(edit_id)))
                     st.success("Wijzigingen opgeslagen.")
+                    st.experimental_rerun()
+                else:
+                    st.warning("Onbekende ID.")
+
+            status_id = colC.number_input("Zet status (Actief/Verkocht) – ID", min_value=0, step=1)
+            new_status = colC.selectbox("Nieuwe status", ["Actief","Verkocht"])
+            if colC.button("Status bijwerken"):
+                if status_id and int(status_id) in df["id"].values:
+                    execute("UPDATE shirts SET status=? WHERE id=?", (new_status, int(status_id)))
+                    st.success("Status bijgewerkt.")
                     st.experimental_rerun()
                 else:
                     st.warning("Onbekende ID.")
@@ -256,7 +299,7 @@ with tabs[2]:
 
     st.markdown("---")
     st.subheader("🧩 Missende shirts (nog niet in je collectie)")
-    df_sh = load_df("SELECT club,seizoen,type FROM shirts")
+    df_sh = load_df("SELECT club,seizoen,type FROM shirts WHERE status='Actief'")
     if df_w.empty:
         st.info("Vul eerst je wenslijst in.")
     else:
@@ -274,21 +317,76 @@ with tabs[2]:
             existing_keys = set(df_sh_["key"]).union(set(df_sh_2["key"]))
             missing = df_w_[~df_w_["key"].isin(existing_keys)].drop(columns=["key"])
         if missing.empty:
-            st.success("Mooi! Alles op je wenslijst zit al in je collectie. ✅")
+            st.success("Mooi! Alles op je wenslijst zit al in je actieve collectie. ✅")
         else:
             st.dataframe(missing, use_container_width=True, hide_index=True)
 
 with tabs[3]:
+    st.subheader("💸 Verkoop & Budget")
+    col_b1, col_b2, col_b3 = st.columns(3)
+    goal = col_b1.number_input("Budgetdoel (€)", min_value=0.0, step=10.0, value=float(get_setting("budget_goal", 0) or 0), format="%.2f")
+    if col_b1.button("Opslaan doel"):
+        set_setting("budget_goal", goal)
+        st.success("Budgetdoel opgeslagen.")
+    df_sales = load_df("SELECT * FROM sales")
+    total_profit = 0.0 if df_sales.empty else float(df_sales["winst"].sum())
+    st.metric("Totaal gerealiseerde winst", f"€ {total_profit:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+    goal_val = float(get_setting("budget_goal", 0) or 0)
+    if goal_val > 0:
+        progress = min(1.0, total_profit/goal_val) if goal_val else 0
+        st.progress(progress, text=f"Voortgang richting doel (€ {goal_val:,.2f})".replace(",", "X").replace(".", ",").replace("X","."))
+
+    st.markdown("---")
+    st.subheader("Shirt verkopen")
+    df_active = load_df("SELECT id, club, seizoen, type, maat, bedrukking, aanschaf_prijs FROM shirts WHERE status='Actief'")
+    if df_active.empty:
+        st.info("Geen actieve shirts om te verkopen.")
+    else:
+        df_active["label"] = df_active.apply(lambda r: f'ID {r["id"]} — {r["club"]} {r["seizoen"]} • {r["type"]} • {r["maat"]} • {r["bedrukking"]}', axis=1)
+        with st.form("sell_form", clear_on_submit=True):
+            sel = st.selectbox("Kies shirt", df_active["label"].tolist())
+            verkoop_prijs = st.number_input("Verkoopprijs (€)", min_value=0.0, step=1.0, format="%.2f")
+            verkoop_kosten = st.number_input("Verkoopkosten/verzend (€)", min_value=0.0, step=1.0, format="%.2f")
+            koper = st.text_input("Koper (optioneel)")
+            opm = st.text_input("Opmerking (optioneel)")
+            datum = st.date_input("Verkoopdatum", value=date.today())
+            submit_sell = st.form_submit_button("Verkoop registreren")
+            if submit_sell:
+                row = df_active[df_active["label"]==sel].iloc[0]
+                kostprijs = float(row["aanschaf_prijs"] or 0)
+                winst = float(verkoop_prijs) - kostprijs - float(verkoop_kosten)
+                execute("""INSERT INTO sales (shirt_id, verkoop_datum, verkoop_prijs, verkoop_kosten, winst, koper, opmerking)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        (int(row["id"]), datum.isoformat(), float(verkoop_prijs), float(verkoop_kosten), winst, koper.strip(), opm.strip()))
+                execute("UPDATE shirts SET status='Verkocht' WHERE id=?", (int(row["id"]),))
+                st.success(f"Verkoop geregistreerd. Winst: € {winst:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+                st.experimental_rerun()
+
+    st.markdown("---")
+    st.subheader("Verkopen overzicht")
+    df_sales = load_df("""
+        SELECT s.id as sale_id, sh.id as shirt_id, sh.club, sh.seizoen, sh.type, sh.maat, sh.bedrukking,
+               sh.aanschaf_prijs, s.verkoop_prijs, s.verkoop_kosten, s.winst, s.verkoop_datum, s.koper, s.opmerking
+        FROM sales s JOIN shirts sh ON s.shirt_id = sh.id
+        ORDER BY s.verkoop_datum DESC, s.id DESC
+    """)
+    if df_sales.empty:
+        st.info("Nog geen verkopen geregistreerd.")
+    else:
+        st.dataframe(df_sales, use_container_width=True, hide_index=True)
+
+with tabs[4]:
     st.subheader("⬇️⬆️ Import / Export")
     col1, col2 = st.columns(2)
     df_all = load_df("SELECT * FROM shirts")
     if not df_all.empty:
-        export_cols = ["club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","foto_path"]
+        export_cols = ["club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","foto_path","status"]
         csv = df_all[export_cols].to_csv(index=False).encode("utf-8")
         col1.download_button("Exporteer collectie (CSV)", csv, "shirts_export.csv", "text/csv")
     else:
-        col1.info("Nog niets te exporteren.")
-    uploaded = col2.file_uploader("Importeer CSV (kolommen: club,seizoen,type(optional),maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info)", type=["csv"], key="csv_imp")
+        col1.info("Nog geen collectie om te exporteren.")
+
+    uploaded = col2.file_uploader("Importeer collectie-CSV (kolommen: club,seizoen,type(optional),maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info)", type=["csv"], key="csv_imp_col")
     if uploaded is not None:
         try:
             imp = pd.read_csv(uploaded)
@@ -299,6 +397,7 @@ with tabs[3]:
                     st.error(f"Kolom '{rc}' ontbreekt in de CSV.")
                     st.stop()
             type_present = "type" in lower_cols
+            status_present = "status" in lower_cols
             colmap = {c.lower().strip(): c for c in imp.columns}
             rows = []
             for _, r in imp.iterrows():
@@ -313,27 +412,55 @@ with tabs[3]:
                     float(r[colmap["aanschaf_prijs"]]),
                     "" if pd.isna(r[colmap["extra_info"]]) else str(r[colmap["extra_info"]]).strip(),
                     None,
+                    status_present and str(r[colmap["status"]]).strip() or "Actief",
                     datetime.utcnow().isoformat(),
                 ))
-            executemany("""INSERT INTO shirts (club,seizoen,type,maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info,foto_path,created_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
-            st.success(f"{len(rows)} rijen geïmporteerd.")
+            executemany("""INSERT INTO shirts (club,seizoen,type,maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info,foto_path,status,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+            st.success(f"{len(rows)} rijen geïmporteerd in collectie.")
         except Exception as e:
             st.error(f"Import mislukt: {e}")
 
-with tabs[4]:
-    st.subheader("Uitleg")
+    st.markdown("---")
+    st.subheader("Wenslijst export/import")
+    df_w = load_df("SELECT * FROM wishlist")
+    if not df_w.empty:
+        wcsv = df_w[["club","seizoen","type","opmerking"]].to_csv(index=False).encode("utf-8")
+        st.download_button("Exporteer wenslijst (CSV)", wcsv, "wenslijst_export.csv", "text/csv")
+    else:
+        st.info("Nog geen wenslijst om te exporteren.")
+
+    up_w = st.file_uploader("Importeer wenslijst-CSV (kolommen: club,seizoen,type(optional),opmerking)", type=["csv"], key="csv_imp_wish")
+    if up_w is not None:
+        try:
+            impw = pd.read_csv(up_w)
+            lower = [c.lower().strip() for c in impw.columns]
+            if "club" not in lower or "seizoen" not in lower:
+                st.error("Kolommen 'club' en 'seizoen' zijn verplicht.")
+                st.stop()
+            colmap = {c.lower().strip(): c for c in impw.columns}
+            type_present = "type" in lower
+            opm_present = "opmerking" in lower
+            rows = []
+            for _, r in impw.iterrows():
+                rows.append((
+                    str(r[colmap["club"]]).strip(),
+                    str(r[colmap["seizoen"]]).strip(),
+                    (str(r[colmap["type"]]).strip() if type_present and pd.notna(r[colmap["type"]]) else None),
+                    (str(r[colmap["opmerking"]]).strip() if opm_present and pd.notna(r[colmap["opmerking"]]) else None),
+                ))
+            executemany("INSERT INTO wishlist (club,seizoen,type,opmerking) VALUES (?,?,?,?)", rows)
+            st.success(f"{len(rows)} wens(en) geïmporteerd.")
+        except Exception as e:
+            st.error(f"Import mislukt: {e}")
+
+with tabs[5]:
+    st.subheader("Uitleg & Tips (v3)")
     st.markdown("""
-**Nieuw in deze versie**
-- **Type** (Thuis/Uit/Derde/Keepers/Special) staat nu bij **Shirt toevoegen** en in het overzicht.
-- **Foto uploaden** bij het toevoegen (en vervangen bij bewerken). Foto's worden opgeslagen in de map **images**.
-- Wenslijst verwijderen kijkt nu naar **Club + Seizoen** en **Type** (indien ingevuld). Als type op de wenslijst leeg is, verdwijnt het item bij elk type dat je toevoegt.
+**Nieuw in v3**
+- **Wenslijst import/export (CSV)** met kolommen: `club,seizoen,type(optional),opmerking`.
+- **Verkoop & Budget**: registreer verkopen, bereken **winst** (= verkoopprijs − aanschafprijs − kosten) en volg je **totaal** en **budgetdoel**.
+- **Status** bij shirts (Actief/Verkocht) + filters. Verkochte shirts blijven zichtbaar bij **Status=Verkocht**.
 
-**Hoe werkt het?**
-- Voeg shirts toe via **Shirt toevoegen** — inclusief optionele foto.
-- Overzicht filtert en sorteert op Club (A→Z), Seizoen-start (nieuw→oud), Type (A→Z).
-- **Wenslijst & Missende**: voeg items toe; als je een match toevoegt, verdwijnt die automatisch uit de wenslijst.
-- **Import/Export**: CSV export bevat een `foto_path` kolom; bij import is `type` optioneel (default = Thuis).
-
-**Tip:** Gebruik seizoen notatie `1995/96` of `2009/10` voor perfecte sortering.
+**Tip:** Gebruik seizoensnotatie `1995/96` of `2009/10` voor perfecte sortering.
 """)

@@ -1,2 +1,1 @@
-# Shirt Collectie App v2
-Zie app.py voor details.
+# Shirt Collectie App v3 — wishlist import/export + sales & budget
