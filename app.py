@@ -4,20 +4,22 @@ import sqlite3
 import pandas as pd
 from contextlib import closing
 from datetime import datetime, date
-import os, base64, mimetypes, json
+import os, base64, mimetypes, json, io
 
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 from st_aggrid.shared import JsCode
+from PIL import Image
 
 DB_PATH = "shirts.db"
 IMAGES_DIR = "images"
+MAX_W, MAX_H = 2000, 2000   # upload resize
+JPEG_QUALITY = 90           # upload quality
 
 # ---------------- DB INIT & MIGRATION ----------------
 def init_db():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        # Core table
         c.execute("""
         CREATE TABLE IF NOT EXISTS shirts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,17 +37,6 @@ def init_db():
             created_at TEXT NOT NULL
         )
         """)
-        # Ensure columns for older DBs
-        cols = {row[1] for row in c.execute("PRAGMA table_info(shirts)").fetchall()}
-        if "type" not in cols:
-            c.execute("ALTER TABLE shirts ADD COLUMN type TEXT NOT NULL DEFAULT 'Thuis'")
-        if "foto_path" not in cols:
-            c.execute("ALTER TABLE shirts ADD COLUMN foto_path TEXT")
-        if "status" not in cols:
-            c.execute("ALTER TABLE shirts ADD COLUMN status TEXT NOT NULL DEFAULT 'Actief'")
-        if "created_at" not in cols:
-            c.execute("ALTER TABLE shirts ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
-        # Wishlist
         c.execute("""
         CREATE TABLE IF NOT EXISTS wishlist (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,7 +46,6 @@ def init_db():
             opmerking TEXT
         )
         """)
-        # Sales
         c.execute("""
         CREATE TABLE IF NOT EXISTS sales (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,14 +59,12 @@ def init_db():
             FOREIGN KEY (shirt_id) REFERENCES shirts(id)
         )
         """)
-        # Settings
         c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
         """)
-        # Photos
         c.execute("""
         CREATE TABLE IF NOT EXISTS photos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,7 +74,6 @@ def init_db():
             FOREIGN KEY (shirt_id) REFERENCES shirts(id)
         )
         """)
-        # Migrate legacy foto_path once
         rows = c.execute("SELECT id, foto_path FROM shirts WHERE foto_path IS NOT NULL AND TRIM(foto_path)<>''").fetchall()
         for sid, p in rows:
             exists = c.execute("SELECT 1 FROM photos WHERE shirt_id=? AND path=?", (sid, p)).fetchone()
@@ -133,27 +120,33 @@ def execute(query, params=()):
         c = conn.cursor()
         c.execute(query, params); conn.commit(); return c.lastrowid
 
-def executemany(query, seq_of_params):
+def executemany(query, seq):
     with closing(get_conn()) as conn:
         c = conn.cursor()
-        c.executemany(query, seq_of_params); conn.commit()
+        c.executemany(query, seq); conn.commit()
+
+def _resize_and_save(image_bytes, dest_path):
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img.thumbnail((MAX_W, MAX_H), Image.LANCZOS)
+    img.save(dest_path, format="JPEG", quality=JPEG_QUALITY, optimize=True)
 
 def save_uploaded_file(uploaded_file):
     if not uploaded_file: return None
-    fname = uploaded_file.name
+    # build path
+    orig = uploaded_file.name
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-    safe = "".join(ch for ch in fname if ch.isalnum() or ch in ("-", "_", ".", " ")).strip().replace(" ", "_")
-    out_name = f"{ts}_{safe}"
+    safe = "".join(ch for ch in orig if ch.isalnum() or ch in ("-", "_", ".", " ")).strip().replace(" ", "_")
+    out_name = f"{ts}_{safe.rsplit('.',1)[0]}.jpg"
     out_path = os.path.join(IMAGES_DIR, out_name)
-    with open(out_path, "wb") as f: f.write(uploaded_file.getbuffer())
+    # resize/compress
+    _resize_and_save(uploaded_file.getbuffer(), out_path)
     return out_path
 
 def to_data_uri(path: str):
     if not path or not os.path.exists(path): return None
-    mime, _ = mimetypes.guess_type(path)
-    if mime is None: mime = "image/jpeg"
-    with open(path, "rb") as f: b64 = base64.b64encode(f.read()).decode("ascii")
-    return f"data:{mime};base64,{b64}"
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
 
 def get_all_photos(shirt_id: int):
     dfp = load_df("SELECT id, path FROM photos WHERE shirt_id=? ORDER BY id ASC", (int(shirt_id),))
@@ -167,10 +160,21 @@ def get_photo_data_uris(shirt_id: int):
         if u: out.append(u)
     return out
 
+def get_setting(key, default=None):
+    df = load_df("SELECT value FROM settings WHERE key=?", (key,))
+    if df.empty: return default
+    return df.iloc[0]["value"]
+
+def set_setting(key, value):
+    if get_setting(key) is None:
+        execute("INSERT INTO settings (key, value) VALUES (?,?)", (key, str(value)))
+    else:
+        execute("UPDATE settings SET value=? WHERE key=?", (str(value), key))
+
 # ---------------- UI ----------------
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide", initial_sidebar_state="collapsed")
 init_db()
-st.title("⚽ Shirt Collectie — v5.2.1 (v5.2 + fullscreen foto)")
+st.title("⚽ Shirt Collectie — v5.2.2 (stabiel in‑rij + fullscreen, fallback & compressie)")
 
 tabs = st.tabs([
     "➕ Shirt toevoegen",
@@ -205,6 +209,8 @@ with tabs[0]:
 # ---------------- TAB 2 ----------------
 with tabs[1]:
     st.subheader("📚 Alle shirts — klik op rij/thumbnail voor grote foto in de rij")
+    fallback = st.toggle("Veilige fotomodus (fallback)", value=False, help="Zet aan als jouw browser/omgeving de in‑rij viewer niet goed weergeeft.")
+
     df = load_df("SELECT * FROM shirts")
     if df.empty:
         st.info("Nog geen shirts in de database.")
@@ -231,7 +237,6 @@ with tabs[1]:
         df_view.sort_values(by=["status","club","seizoen_start","type"], ascending=[True, True, False, True], inplace=True)
         df_view.drop(columns=["seizoen_start"], inplace=True)
 
-        # thumbs + gallery
         thumbs, galleries = [], []
         for _, r in df_view.iterrows():
             imgs = get_photo_data_uris(int(r["id"]))
@@ -244,8 +249,11 @@ with tabs[1]:
         grid_df = df_view[show_cols].copy()
 
         go = GridOptionsBuilder.from_dataframe(grid_df)
-        go.configure_selection("single")  # row-click
-        go.configure_grid_options(domLayout='autoHeight', masterDetail=True, detailRowAutoHeight=True, detailRowHeight=700)
+        go.configure_selection("single")
+        if not fallback:
+            go.configure_grid_options(domLayout='autoHeight', masterDetail=True, detailRowAutoHeight=True, detailRowHeight=700)
+        else:
+            go.configure_grid_options(domLayout='autoHeight')
 
         thumb_renderer = JsCode("""
         class ThumbRenderer {
@@ -253,8 +261,8 @@ with tabs[1]:
             this.eGui = document.createElement('div');
             const u = p.value;
             if (u){
-              this.eGui.innerHTML = `<img src="${u}" style="height:56px;border-radius:6px;cursor:pointer" title="Klik voor grote foto">`;
-              this.eGui.addEventListener('click', ()=> p.node.setExpanded(!p.node.expanded));
+              this.eGui.innerHTML = `<img src="${u}" style="height:56px;border-radius:6px;cursor:pointer" title="Klik voor foto">`;
+              this.eGui.addEventListener('click', ()=> { if(p.node.master) p.node.setExpanded(!p.node.expanded); });
             } else {
               this.eGui.innerHTML = `<div style="height:56px;display:flex;align-items:center;color:#bbb">(geen foto)</div>`;
             }
@@ -264,106 +272,101 @@ with tabs[1]:
         go.configure_column("thumb", headerName="Foto", width=120, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=False, cellRenderer=thumb_renderer)
         go.configure_column("gallery_urls", hide=True)
 
-        on_row_click = JsCode("""
-        function(p){
-          p.api.forEachNode(n => { if (n.master && n !== p.node) n.setExpanded(false); });
-          if (p.node.master){ p.node.setExpanded(!p.node.expanded); }
-        }""")
-        go.configure_grid_options(onRowClicked=on_row_click)
+        if not fallback:
+            on_row_click = JsCode("""
+            function(p){
+              p.api.forEachNode(n => { if (n.master && n !== p.node) n.setExpanded(false); });
+              if (p.node.master){ p.node.setExpanded(!p.node.expanded); }
+            }""")
+            go.configure_grid_options(onRowClicked=on_row_click)
 
-        # Detail renderer with fixed-size frame + fullscreen overlay
-        detail_renderer = JsCode("""
-        class DetailCellRenderer {
-          init(p){
-            this.eGui = document.createElement('div');
-            this.eGui.style.padding = '10px';
-            const gal = JSON.parse(p.data.gallery_urls || "[]");
-            const first = gal.length ? gal[0] : null;
+            # Robust detail renderer, overlay local to cell
+            detail_renderer = JsCode("""
+            class DetailCellRenderer {
+              init(p){
+                this.eGui = document.createElement('div');
+                this.eGui.style.padding = '10px';
+                const gal = JSON.parse(p.data.gallery_urls || "[]");
+                const first = gal.length ? gal[0] : null;
 
-            const wrap = document.createElement('div');
-            wrap.style.display = 'grid';
-            wrap.style.gridTemplateColumns = '1fr';
-            wrap.style.rowGap = '10px';
+                const wrap = document.createElement('div');
+                wrap.style.display = 'grid';
+                wrap.style.gridTemplateColumns = '1fr';
+                wrap.style.rowGap = '10px';
 
-            // --- Controls ---
-            const controls = document.createElement('div');
-            controls.style.display = 'flex';
-            controls.style.justifyContent = 'space-between';
-            controls.style.gap = '8px';
+                const controls = document.createElement('div');
+                controls.style.display = 'flex';
+                controls.style.justifyContent = 'space-between';
+                controls.style.gap = '8px';
 
-            // size buttons
-            const leftCtrls = document.createElement('div');
-            leftCtrls.style.display='flex'; leftCtrls.style.gap='8px';
-            const mkBtn = (t)=>{ const b=document.createElement('button'); b.textContent=t; b.style.cursor='pointer'; b.style.padding='4px 8px'; b.style.borderRadius='6px'; b.style.border='1px solid #444'; b.style.background='#222'; b.style.color='#ddd'; return b; };
-            const bS=mkBtn('Klein'), bM=mkBtn('Groot'), bL=mkBtn('XL');
-            leftCtrls.appendChild(bS); leftCtrls.appendChild(bM); leftCtrls.appendChild(bL);
+                const leftCtrls = document.createElement('div');
+                leftCtrls.style.display='flex'; leftCtrls.style.gap='8px';
+                const mkBtn = (t)=>{ const b=document.createElement('button'); b.textContent=t; b.style.cursor='pointer'; b.style.padding='4px 8px'; b.style.borderRadius='6px'; b.style.border='1px solid #444'; b.style.background='#222'; b.style.color='#ddd'; return b; };
+                const bS=mkBtn('Klein'), bM=mkBtn('Groot'), bL=mkBtn('XL');
+                leftCtrls.appendChild(bS); leftCtrls.appendChild(bM); leftCtrls.appendChild(bL);
 
-            // fullscreen button
-            const rightCtrls = document.createElement('div');
-            const bFS = mkBtn('Volledig scherm');
-            rightCtrls.appendChild(bFS);
-            controls.appendChild(leftCtrls); controls.appendChild(rightCtrls);
+                const rightCtrls = document.createElement('div');
+                const bFS = mkBtn('Volledig scherm');
+                rightCtrls.appendChild(bFS);
+                controls.appendChild(leftCtrls); controls.appendChild(rightCtrls);
 
-            // --- Frame (stable height) ---
-            const frame = document.createElement('div');
-            frame.style.width = '100%';
-            frame.style.height = '60vh';   // default 60vh
-            frame.style.overflow = 'hidden';
-            frame.style.display = 'flex';
-            frame.style.alignItems = 'center';
-            frame.style.justifyContent = 'center';
-            frame.style.borderRadius = '12px';
-            frame.style.background = '#111';
+                const frame = document.createElement('div');
+                frame.style.width = '100%';
+                frame.style.height = '60vh';
+                frame.style.overflow = 'hidden';
+                frame.style.display = 'flex';
+                frame.style.alignItems = 'center';
+                frame.style.justifyContent = 'center';
+                frame.style.borderRadius = '12px';
+                frame.style.background = '#111';
 
-            const big = document.createElement('img');
-            big.style.maxWidth = '100%';
-            big.style.maxHeight = '100%';
-            big.style.objectFit = 'contain';   // keep aspect ratio
-            if (first) big.src = first;
+                const big = document.createElement('img');
+                big.style.maxWidth = '100%';
+                big.style.maxHeight = '100%';
+                big.style.objectFit = 'contain';
+                if (first) big.src = first;
 
-            bS.onclick = ()=>{ frame.style.height='40vh'; };
-            bM.onclick = ()=>{ frame.style.height='60vh'; };
-            bL.onclick = ()=>{ frame.style.height='85vh'; };
+                bS.onclick = ()=>{ frame.style.height='40vh'; };
+                bM.onclick = ()=>{ frame.style.height='60vh'; };
+                bL.onclick = ()=>{ frame.style.height='85vh'; };
 
-            // --- Fullscreen overlay ---
-            const overlay = document.createElement('div');
-            overlay.style.position='fixed';
-            overlay.style.left='0'; overlay.style.top='0';
-            overlay.style.width='100vw'; overlay.style.height='100vh';
-            overlay.style.background='rgba(0,0,0,0.95)';
-            overlay.style.display='none';
-            overlay.style.zIndex='9999';
-            overlay.style.alignItems='center';
-            overlay.style.justifyContent='center';
-            const fsImg = document.createElement('img');
-            fsImg.style.maxWidth='95vw'; fsImg.style.maxHeight='95vh';
-            fsImg.style.objectFit='contain';
-            overlay.appendChild(fsImg);
-            overlay.addEventListener('click', ()=>{ overlay.style.display='none'; });
-            document.body.appendChild(overlay);
-            document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') overlay.style.display='none'; });
+                // local overlay inside this.eGui (no document.body usage)
+                const overlay = document.createElement('div');
+                overlay.style.position='fixed';
+                overlay.style.left='0'; overlay.style.top='0';
+                overlay.style.width='100vw'; overlay.style.height='100vh';
+                overlay.style.background='rgba(0,0,0,0.95)';
+                overlay.style.display='none';
+                overlay.style.zIndex='99999';
+                overlay.style.alignItems='center';
+                overlay.style.justifyContent='center';
+                const fsImg = document.createElement('img');
+                fsImg.style.maxWidth='95vw'; fsImg.style.maxHeight='95vh';
+                fsImg.style.objectFit='contain';
+                overlay.appendChild(fsImg);
+                overlay.addEventListener('click', ()=>{ overlay.style.display='none'; });
+                window.addEventListener('keydown', (e)=>{ if(e.key==='Escape') overlay.style.display='none'; });
+                this.eGui.appendChild(overlay);
+                bFS.onclick = ()=>{ fsImg.src = big.src; overlay.style.display='flex'; };
 
-            bFS.onclick = ()=>{ fsImg.src = big.src; overlay.style.display='flex'; };
+                frame.appendChild(big);
 
-            frame.appendChild(big);
+                const strip = document.createElement('div');
+                strip.style.display='flex'; strip.style.flexWrap='wrap'; strip.style.gap='8px';
+                gal.forEach(u=>{ const t=document.createElement('img'); t.src=u; t.style.height='64px'; t.style.borderRadius='8px'; t.style.cursor='pointer'; t.onclick=()=>{ big.src=u; }; strip.appendChild(t); });
 
-            // --- Thumbnails ---
-            const strip = document.createElement('div');
-            strip.style.display='flex'; strip.style.flexWrap='wrap'; strip.style.gap='8px';
-            gal.forEach(u=>{ const t=document.createElement('img'); t.src=u; t.style.height='64px'; t.style.borderRadius='8px'; t.style.cursor='pointer'; t.onclick=()=>{ big.src=u; }; strip.appendChild(t); });
-
-            if (!first){
-              this.eGui.innerHTML = `<div style="color:#bbb">Geen foto's. Voeg ze hieronder toe in 'Foto's beheren'.</div>`;
-            }else{
-              wrap.appendChild(controls);
-              wrap.appendChild(frame);
-              if (gal.length>1) wrap.appendChild(strip);
-              this.eGui.appendChild(wrap);
-            }
-          }
-          getGui(){ return this.eGui; }
-        }""")
-        go.configure_grid_options(detailCellRenderer=detail_renderer)
+                if (!first){
+                  this.eGui.innerHTML = `<div style="color:#bbb">Geen foto's. Voeg ze toe via 'Foto's beheren' hieronder.</div>`;
+                }else{
+                  wrap.appendChild(controls);
+                  wrap.appendChild(frame);
+                  if (gal.length>1) wrap.appendChild(strip);
+                  this.eGui.appendChild(wrap);
+                }
+              }
+              getGui(){ return this.eGui; }
+            }""")
+            go.configure_grid_options(detailCellRenderer=detail_renderer)
 
         grid = AgGrid(
             grid_df,
@@ -375,15 +378,24 @@ with tabs[1]:
             enable_enterprise_modules=True
         )
 
+        # Fallback preview (if enabled)
+        if fallback:
+            sel = grid["selected_rows"]
+            if sel:
+                rid = int(sel[0]["id"])
+                imgs = get_photo_data_uris(rid)
+                if imgs:
+                    st.image(imgs[0], use_container_width=True, caption="Voorbeeld (fallback-modus) — klik hierboven op rij voor andere foto via strip in normale modus.")
+                else:
+                    st.info("Geen foto's bij dit shirt.")
+
         st.markdown("---")
         st.subheader("📷 Foto's beheren (geselecteerde rij)")
         sel = grid["selected_rows"]
         if not sel:
             st.info("Klik een rij in de tabel. Dan kun je hieronder foto's toevoegen of verwijderen.")
         else:
-            # Photo management panel identical to v5.2
             rid = int(sel[0]["id"])
-            # show existing photos
             dfp = load_df("SELECT id, path FROM photos WHERE shirt_id=? ORDER BY id ASC", (rid,))
             if dfp.empty:
                 st.info("Nog geen foto's bij dit shirt.")
@@ -395,11 +407,12 @@ with tabs[1]:
                     if st.button(f"🗑️ Verwijder {os.path.basename(row['path'])}", key=f"del_{rid}_{row['id']}"):
                         try:
                             if os.path.exists(row["path"]): os.remove(row["path"])
-                        except Exception: pass
+                        except Exception:
+                            pass
                         execute("DELETE FROM photos WHERE id=?", (row["id"],))
                         st.experimental_rerun()
 
-            ups = st.file_uploader("Meerdere foto's kiezen", type=["jpg","jpeg","png"], accept_multiple_files=True, key=f"up_{rid}")
+            ups = st.file_uploader("Meerdere foto's kiezen (max ~2000px, JPEG)", type=["jpg","jpeg","png"], accept_multiple_files=True, key=f"up_{rid}")
             if st.button("📥 Upload geselecteerde foto('s')", key=f"btn_up_{rid}"):
                 if not ups:
                     st.warning("Geen bestanden gekozen.")
@@ -410,7 +423,7 @@ with tabs[1]:
                         if path:
                             execute("INSERT INTO photos (shirt_id, path, created_at) VALUES (?,?,?)", (rid, path, datetime.utcnow().isoformat()))
                             n+=1
-                    st.success(f"{n} foto('s) toegevoegd.")
+                    st.success(f"{n} foto('s) toegevoegd (automatisch verkleind/gecomprimeerd).")
                     st.experimental_rerun()
 
 # ---------------- TAB 3 ----------------
@@ -424,7 +437,6 @@ with tabs[2]:
         w_opm = c4.text_input("Opmerking", "")
         if st.form_submit_button("➕ Toevoegen aan wenslijst"):
             t_norm = normalize_type(w_type) if w_type else None
-            # prevent duplicates
             dfw = load_df("SELECT club,seizoen,type FROM wishlist")
             key = w_club.lower().strip()+"||"+w_seizoen.lower().strip()+"||"+(t_norm or "").lower().strip()
             exists = False
@@ -472,16 +484,6 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("💸 Verkoop & Budget")
     colA, colB = st.columns([1,2])
-    def get_setting(key, default=None):
-        df = load_df("SELECT value FROM settings WHERE key=?", (key,))
-        if df.empty: return default
-        return df.iloc[0]["value"]
-    def set_setting(key, value):
-        if get_setting(key) is None:
-            execute("INSERT INTO settings (key, value) VALUES (?,?)", (key, str(value)))
-        else:
-            execute("UPDATE settings SET value=? WHERE key=?", (str(value), key))
-
     goal = colA.number_input("Budgetdoel (€)", min_value=0.0, step=10.0, value=float(get_setting("budget_goal", 0) or 0), format="%.2f")
     if colA.button("Opslaan doel"):
         set_setting("budget_goal", goal); st.success("Budgetdoel opgeslagen.")
@@ -521,7 +523,6 @@ with tabs[4]:
     st.subheader("⬇️⬆️ Import / Export")
 
     col1, col2 = st.columns(2)
-    # Export collection
     df_all = load_df("SELECT * FROM shirts")
     if not df_all.empty:
         export_cols = ["club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","status"]
@@ -530,7 +531,6 @@ with tabs[4]:
     else:
         col1.info("Nog geen collectie om te exporteren.")
 
-    # Import collection
     uploaded = col2.file_uploader("Importeer collectie-CSV (kolommen: club,seizoen,type(optional),maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info)", type=["csv"])
     if uploaded is not None:
         try:
