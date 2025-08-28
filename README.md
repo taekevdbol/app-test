@@ -1,1 +1,1 @@
-# v3.8: echte rij-uitklap met toggle-kolom + import zonder duplicaten + leegknoppen voor wenslijst
+# v3.9: custom JS detail renderer (foto tussen rijen) + stabiele Missende shirts + wenslijst import modes
