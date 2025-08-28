@@ -4,7 +4,7 @@ import sqlite3
 import pandas as pd
 from contextlib import closing
 from datetime import datetime, date
-import os, base64, json
+import os, base64, json, mimetypes
 
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 from st_aggrid.shared import JsCode
@@ -12,6 +12,7 @@ from st_aggrid.shared import JsCode
 DB_PATH = "shirts.db"
 IMAGES_DIR = "images"
 
+# ---------------- DB ----------------
 def init_db():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
@@ -50,16 +51,17 @@ def executemany(q, seq):
     with closing(get_conn()) as conn:
         c = conn.cursor(); c.executemany(q, seq); conn.commit()
 
-import mimetypes, base64
+# ---------------- Helpers ----------------
 def to_data_uri(path):
     if not path or not os.path.exists(path): return None
     mime, _ = mimetypes.guess_type(path)
     if not mime: mime = "image/jpeg"
-    with open(path, "rb") as f: b64 = base64.b64encode(f.read()).decode("ascii")
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
 def get_photo_data_uris(shirt_id:int):
-    rows = load_df("SELECT path FROM photos WHERE shirt_id=? ORDER BY id ASC", (int(shirt_id),))
+    rows = load_df("SELECT id, path FROM photos WHERE shirt_id=? ORDER BY id ASC", (int(shirt_id),))
     if rows.empty: return []
     out=[]
     for p in rows["path"].tolist():
@@ -67,16 +69,16 @@ def get_photo_data_uris(shirt_id:int):
         if u: out.append(u)
     return out
 
+def parse_season_start(s):
+    if not s: return -1
+    s = str(s); digits = "".join(ch for ch in s if ch.isdigit())
+    return int(digits[:4]) if len(digits)>=4 else -1
+
 def normalize_type(val):
     if val is None or (isinstance(val, float) and pd.isna(val)): return None
     s = str(val).strip().lower()
     m = {"thuis":"Thuis","home":"Thuis","uit":"Uit","away":"Uit","derde":"Derde","third":"Derde","3e":"Derde","keepers":"Keepers","gk":"Keepers","special":"Special"}
     return m.get(s, s.title())
-
-def parse_season_start(s):
-    if not s: return -1
-    s = str(s); digits = "".join(ch for ch in s if ch.isdigit())
-    return int(digits[:4]) if len(digits)>=4 else -1
 
 def get_setting(key, default=None):
     df = load_df("SELECT value FROM settings WHERE key=?", (key,))
@@ -87,15 +89,25 @@ def set_setting(key,val):
     if get_setting(key) is None: execute("INSERT INTO settings (key,value) VALUES (?,?)",(key,str(val)))
     else: execute("UPDATE settings SET value=? WHERE key=?", (str(val), key))
 
+def save_uploaded_file(uploaded_file):
+    if not uploaded_file: return None
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    safe = "".join(ch for ch in uploaded_file.name if ch.isalnum() or ch in ("-","_","."," ")).strip().replace(" ","_")
+    out = os.path.join(IMAGES_DIR, f"{ts}_{safe}")
+    with open(out, "wb") as f: f.write(uploaded_file.getbuffer())
+    return out
+
+# ---------------- UI ----------------
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide")
 init_db()
-st.title("⚽ Shirt Collectie — v5.2.4 (klik‑om‑te‑vergroten in dezelfde rij)")
+st.title("⚽ Shirt Collectie — v5.2.5 (inline vergroten + snelle foto‑acties)")
 
 TYPES = ["Thuis","Uit","Derde","Keepers","Special"]
 MAATEN = ["Kids XS","Kids S","Kids M","Kids L","XS","S","M","L","XL","XXL","XXXL"]
 
 tabs = st.tabs(["➕ Shirt toevoegen","📚 Collectie (klik foto)","⭐ Wenslijst & Missende shirts","💸 Verkoop & Budget","⬇️⬆️ Import / Export"])
 
+# -------- TAB 1 --------
 with tabs[0]:
     st.subheader("➕ Nieuw shirt toevoegen")
     with st.form("add", clear_on_submit=True):
@@ -112,23 +124,25 @@ with tabs[0]:
                     (club.strip(), seizoen.strip(), tsel, maat, bedr.strip(), serie.strip(), zelf, float(prijs), extra.strip(), "Actief", datetime.utcnow().isoformat()))
             st.success("Shirt toegevoegd.")
 
+# -------- TAB 2 --------
 with tabs[1]:
-    st.subheader("📚 Klik op de foto (zelfde rij wordt hoger; andere rijen schuiven omlaag)")
+    st.subheader("📚 Klik op de foto (zelfde rij wordt hoger; andere rijen schuiven mee)")
 
     df = load_df("SELECT * FROM shirts")
     if df.empty:
         st.info("Nog geen shirts.")
     else:
         f1,f2,f3,f4,f5,f6 = st.columns(6)
-        m = pd.Series(True, index=df.index)
-        v1=f1.text_input("Filter club");    m &= df["club"].str.contains(v1, case=False, na=False) if v1 else m
-        v2=f2.text_input("Filter seizoen"); m &= df["seizoen"].str.contains(v2, case=False, na=False) if v2 else m
-        v3=f3.multiselect("Type", TYPES);   m &= df["type"].isin(v3) if v3 else m
-        v4=f4.multiselect("Maat", sorted(df["maat"].unique().tolist())); m &= df["maat"].isin(v4) if v4 else m
-        v5=f5.multiselect("Zelf gekocht", ["Ja","Nee"]); m &= df["zelf_gekocht"].isin(v5) if v5 else m
-        v6=f6.multiselect("Status", ["Actief","Verkocht"], default=["Actief","Verkocht"]); m &= df["status"].isin(v6) if v6 else m
+        mask = pd.Series(True, index=df.index)
+        v1=f1.text_input("Filter club");    mask &= df["club"].str.contains(v1, case=False, na=False) if v1 else mask
+        v2=f2.text_input("Filter seizoen"); mask &= df["seizoen"].str.contains(v2, case=False, na=False) if v2 else mask
+        v3=f3.multiselect("Type", TYPES);   mask &= df["type"].isin(v3) if v3 else mask
+        v4=f4.multiselect("Maat", sorted(df["maat"].unique().tolist())); mask &= df["maat"].isin(v4) if v4 else mask
+        v5=f5.multiselect("Zelf gekocht", ["Ja","Nee"]); mask &= df["zelf_gekocht"].isin(v5) if v5 else mask
+        v6=f6.multiselect("Status", ["Actief","Verkocht"], default=["Actief","Verkocht"]); mask &= df["status"].isin(v6) if v6 else mask
 
-        dfv = df[m].copy(); dfv["seizoen_start"]=dfv["seizoen"].apply(parse_season_start)
+        dfv = df[mask].copy()
+        dfv["seizoen_start"]=dfv["seizoen"].apply(parse_season_start)
         dfv.sort_values(by=["status","club","seizoen_start","type"], ascending=[True,True,False,True], inplace=True)
         dfv.drop(columns=["seizoen_start"], inplace=True)
 
@@ -146,7 +160,6 @@ with tabs[1]:
         go.configure_selection("single")
         go.configure_grid_options(domLayout='autoHeight')
 
-        # Set dynamic row height based on _expanded
         get_row_height = JsCode("""
         function(params){
           if (params && params.data && params.data._expanded){ return 420; }
@@ -154,39 +167,23 @@ with tabs[1]:
         }""")
         go.configure_grid_options(getRowHeight=get_row_height)
 
-        # Inline renderer that toggles expanded and resizes row
         renderer = JsCode("""
         class InlinePhotoRenderer {
           init(p){
-            this.params=p;
             const gal = JSON.parse(p.data.gallery_urls || "[]");
             const first = gal.length ? gal[0] : null;
-
             this.eGui = document.createElement('div');
-            this.eGui.style.height='100%';
-            this.eGui.style.display='flex';
-            this.eGui.style.alignItems='center';
-            this.eGui.style.justifyContent='center';
-            this.eGui.style.overflow='hidden';
-            this.eGui.style.cursor='pointer';
-
+            this.eGui.style.height='100%'; this.eGui.style.display='flex';
+            this.eGui.style.alignItems='center'; this.eGui.style.justifyContent='center';
+            this.eGui.style.overflow='hidden'; this.eGui.style.cursor='pointer';
             const img = document.createElement('img');
-            img.style.maxHeight='100%';
-            img.style.maxWidth='100%';
-            img.style.objectFit='contain';
-            if(first) img.src = first;
-            this.eGui.appendChild(img);
-
-            this.eGui.addEventListener('click', ()=>{
-               // toggle expanded flag on this row
-               p.node.data._expanded = !p.node.data._expanded;
-               p.api.resetRowHeights();
-            });
+            img.style.maxHeight='100%'; img.style.maxWidth='100%'; img.style.objectFit='contain';
+            if(first) img.src = first; this.eGui.appendChild(img);
+            this.eGui.addEventListener('click', ()=>{ p.node.data._expanded = !p.node.data._expanded; p.api.resetRowHeights(); });
           }
           getGui(){ return this.eGui; }
-          refresh(p){ this.params=p; return true; }
+          refresh(p){ return true; }
         }""")
-
         go.configure_column("thumb", headerName="Foto", width=260, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=True, cellRenderer=renderer)
         go.configure_column("gallery_urls", hide=True)
         go.configure_column("_expanded", hide=True)
@@ -198,6 +195,42 @@ with tabs[1]:
             fit_columns_on_grid_load=True, allow_unsafe_jscode=True, enable_enterprise_modules=True
         )
 
+        # Snelle foto‑acties (compact paneel) – verschijnt alleen als een rij is geselecteerd
+        sel = grid["selected_rows"]
+        if sel:
+            rid = int(sel[0]["id"])
+            with st.expander("📷 Foto‑acties voor geselecteerde rij", expanded=True):
+                cA, cB = st.columns([2,1])
+                # thumbnails + delete
+                dfp = load_df("SELECT id, path FROM photos WHERE shirt_id=? ORDER BY id ASC", (rid,))
+                if dfp.empty:
+                    cA.info("Nog geen foto's voor dit shirt.")
+                else:
+                    for row in dfp.to_dict('records'):
+                        c = cA.container()
+                        c.image(row["path"], use_column_width=True)
+                        if c.button(f"🗑️ Verwijder", key=f"del_{rid}_{row['id']}"):
+                            try:
+                                if os.path.exists(row["path"]): os.remove(row["path"])
+                            except Exception:
+                                pass
+                            execute("DELETE FROM photos WHERE id=?", (row["id"],))
+                            st.experimental_rerun()
+                # uploader
+                ups = cB.file_uploader("Nieuwe foto('s)", type=["jpg","jpeg","png"], accept_multiple_files=True, key=f"up_{rid}")
+                if cB.button("📥 Upload", key=f"btn_up_{rid}"):
+                    if not ups:
+                        st.warning("Geen bestanden gekozen.")
+                    else:
+                        n=0
+                        for uf in ups:
+                            path = save_uploaded_file(uf)
+                            if path:
+                                execute("INSERT INTO photos (shirt_id, path, created_at) VALUES (?,?,?)", (rid, path, datetime.utcnow().isoformat()))
+                                n+=1
+                        st.success(f"{n} foto('s) toegevoegd."); st.experimental_rerun()
+
+# -------- TAB 3 --------
 with tabs[2]:
     st.subheader("⭐ Wenslijst")
     with st.form("add_wish", clear_on_submit=True):
@@ -208,13 +241,19 @@ with tabs[2]:
             execute("INSERT INTO wishlist (club,seizoen,type,opmerking) VALUES (?,?,?,?)", (club.strip(), seizoen.strip(), tnorm, opm.strip()))
             st.success("Wens toegevoegd.")
     dfw = load_df("SELECT * FROM wishlist")
-    st.dataframe(dfw, use_container_width=True, hide_index=True) if not dfw.empty else st.info("Nog geen items.")
-    st.markdown("---")
-    st.subheader("🧩 Missende shirts")
-    df_sh = load_df("SELECT club,seizoen,type FROM shirts WHERE status='Actief'")
-    if dfw.empty: st.info("Vul of importeer eerst je wenslijst.")
+    if not dfw.empty:
+        st.dataframe(dfw, use_container_width=True, hide_index=True)
     else:
-        if df_sh.empty: missing=dfw.copy()
+        st.info("Nog geen items in de wenslijst.")
+
+    st.markdown("---")
+    st.subheader("🧩 Missende shirts (niet in collectie)")
+    df_sh = load_df("SELECT club,seizoen,type FROM shirts WHERE status='Actief'")
+    if dfw.empty:
+        st.info("Vul of importeer eerst je wenslijst.")
+    else:
+        if df_sh.empty:
+            missing = dfw.copy()
         else:
             dfw_ = dfw.copy(); dfw_["type"]=dfw_["type"].fillna("").apply(normalize_type).fillna("")
             dfw_["key"]=dfw_["club"].str.lower().str.strip()+"||"+dfw_["seizoen"].astype(str).str.lower().str.strip()+"||"+dfw_["type"].str.lower().str.strip()
@@ -222,8 +261,12 @@ with tabs[2]:
             dsh["key"]=dsh["club"].str.lower().str.strip()+"||"+dsh["seizoen"].astype(str).str.lower().str.strip()+"||"+dsh["type"].str.lower().str.strip()
             dsh2 = df_sh.copy(); dsh2["key"]=dsh2["club"].str.lower().str.strip()+"||"+dsh2["seizoen"].astype(str).str.lower().str.strip()+"||"
             exist=set(dsh["key"]).union(set(dsh2["key"])); missing=dfw_[~dfw_["key"].isin(exist)].drop(columns=["key"])
-        st.dataframe(missing, use_container_width=True, hide_index=True) if not missing.empty else st.success("Alles aanwezig.")
+        if not missing.empty:
+            st.dataframe(missing, use_container_width=True, hide_index=True)
+        else:
+            st.success("Alles van je wenslijst zit al in je actieve collectie.")
 
+# -------- TAB 4 --------
 with tabs[3]:
     st.subheader("💸 Verkoop & Budget")
     colA,colB=st.columns([1,2])
@@ -250,6 +293,7 @@ with tabs[3]:
                 execute("UPDATE shirts SET status='Verkocht' WHERE id=?", (int(row["id"]),))
                 st.success(f"Verkoop geregistreerd. Winst: € {winst:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
 
+# -------- TAB 5 --------
 with tabs[4]:
     st.subheader("⬇️⬆️ Import / Export")
     col1,col2=st.columns(2)
