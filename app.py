@@ -3,8 +3,8 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from contextlib import closing
-from datetime import datetime, date
-import os, base64, mimetypes
+from datetime import datetime
+import os, mimetypes, base64, json
 
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 from st_aggrid.shared import JsCode
@@ -12,7 +12,6 @@ from st_aggrid.shared import JsCode
 DB_PATH = "shirts.db"
 IMAGES_DIR = "images"
 
-# ---------------- DB INIT ----------------
 def init_db():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
@@ -29,18 +28,8 @@ def init_db():
             zelf_gekocht TEXT NOT NULL CHECK (zelf_gekocht IN ('Ja','Nee')),
             aanschaf_prijs REAL NOT NULL,
             extra_info TEXT,
-            foto_path TEXT,
             status TEXT NOT NULL DEFAULT 'Actief',
             created_at TEXT NOT NULL
-        )
-        """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS wishlist (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            club TEXT NOT NULL,
-            seizoen TEXT NOT NULL,
-            type TEXT,
-            opmerking TEXT
         )
         """)
         c.execute("""
@@ -52,178 +41,81 @@ def init_db():
             FOREIGN KEY (shirt_id) REFERENCES shirts(id)
         )
         """)
-        # migrate legacy foto_path once
-        rows = c.execute("SELECT id, foto_path FROM shirts WHERE foto_path IS NOT NULL AND TRIM(foto_path)<>''").fetchall()
-        for sid, p in rows:
-            exists = c.execute("SELECT 1 FROM photos WHERE shirt_id=? AND path=?", (sid, p)).fetchone()
-            if not exists and os.path.exists(p):
-                c.execute("INSERT INTO photos (shirt_id, path, created_at) VALUES (?,?,?)", (sid, p, datetime.utcnow().isoformat()))
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shirt_id INTEGER NOT NULL,
-            verkoop_datum TEXT NOT NULL,
-            verkoop_prijs REAL NOT NULL,
-            verkoop_kosten REAL NOT NULL DEFAULT 0.0,
-            winst REAL NOT NULL,
-            koper TEXT,
-            opmerking TEXT,
-            FOREIGN KEY (shirt_id) REFERENCES shirts(id)
-        )
-        """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """)
         conn.commit()
 
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-# ---------------- HELPERS ----------------
-TYPES = ["Thuis","Uit","Derde","Keepers","Special"]
-MAATEN = ["Kids XS","Kids S","Kids M","Kids L","XS","S","M","L","XL","XXL","XXXL"]
-
-def normalize_type(val):
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None
-    s = str(val).strip().lower()
-    mapping = {
-        "thuis":"Thuis", "home":"Thuis",
-        "uit":"Uit", "away":"Uit",
-        "derde":"Derde", "third":"Derde", "3e":"Derde",
-        "keepers":"Keepers", "keeper":"Keepers", "gk":"Keepers",
-        "special":"Special", "limited":"Special"
-    }
-    return mapping.get(s, s.title())
-
-def parse_season_start(season_text: str) -> int:
-    if not season_text:
-        return -1
-    s = str(season_text).strip()
-    digits = ''.join([ch for ch in s if ch.isdigit()])
-    if len(digits) >= 4:
-        try:
-            return int(digits[:4])
-        except:
-            return -1
-    return -1
-
-def load_df(query, params=()):
+def load_df(q, p=()):
     with closing(get_conn()) as conn:
-        return pd.read_sql_query(query, conn, params=params)
+        return pd.read_sql_query(q, conn, params=p)
 
-def execute(query, params=()):
+def execute(q, p=()):
     with closing(get_conn()) as conn:
         c = conn.cursor()
-        c.execute(query, params)
-        conn.commit()
-        return c.lastrowid
+        c.execute(q, p); conn.commit(); return c.lastrowid
 
-def executemany(query, seq_of_params):
-    with closing(get_conn()) as conn:
-        c = conn.cursor()
-        c.executemany(query, seq_of_params)
-        conn.commit()
-
-def save_uploaded_file(uploaded_file):
-    if not uploaded_file:
-        return None
-    fname = uploaded_file.name
+def save_uploaded_file(up):
+    if not up: return None
+    name = up.name
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-    safe = "".join(ch for ch in fname if ch.isalnum() or ch in ("-", "_", ".", " ")).strip().replace(" ", "_")
-    out_name = f"{ts}_{safe}"
-    out_path = os.path.join(IMAGES_DIR, out_name)
-    with open(out_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return out_path
+    safe = "".join(ch for ch in name if ch.isalnum() or ch in ('-','_','.',' ')).replace(' ','_')
+    out = os.path.join(IMAGES_DIR, f"{ts}_{safe}")
+    with open(out, "wb") as f: f.write(up.getbuffer())
+    return out
 
-def to_data_uri(path: str):
-    if not path or not os.path.exists(path):
-        return None
+def to_data_uri(path):
+    if not path or not os.path.exists(path): return None
     mime, _ = mimetypes.guess_type(path)
-    if mime is None: mime = "image/jpeg"
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("ascii")
+    if not mime: mime = "image/jpeg"
+    with open(path, "rb") as f: b64 = base64.b64encode(f.read()).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
-def get_all_photos(shirt_id: int):
-    dfp = load_df("SELECT id, path FROM photos WHERE shirt_id=? ORDER BY id ASC", (int(shirt_id),))
-    return [] if dfp.empty else dfp.to_dict("records")
+def get_photos(shirt_id:int):
+    df = load_df("SELECT id, path FROM photos WHERE shirt_id=? ORDER BY id", (int(shirt_id),))
+    return [] if df.empty else df.to_dict("records")
 
-def first_photo_data_uri(shirt_id: int):
-    rows = get_all_photos(shirt_id)
-    if not rows: return None
-    return to_data_uri(rows[0]["path"])
-
-# ---------------- UI ----------------
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide", initial_sidebar_state="collapsed")
 init_db()
-st.title("⚽ Shirt Collectie — v4.6 (rij-klik + grote foto in de rij)")
+st.title("⚽ Shirt Collectie — v4.7 (in-rij vergroten + multi-foto)")
 
-tabs = st.tabs([
-    "➕ Shirt toevoegen",
-    "📚 Alle shirts (klik rij om foto te tonen)",
-    "⭐ Wenslijst & Missende shirts",
-    "💸 Verkoop & Budget",
-    "⬇️⬆️ Import / Export",
-])
+tab1, tab2 = st.tabs(["📚 Collectie (klik rij/thumbnail)","📷 Foto's toevoegen bij geselecteerde rij"])
 
-# ---------------- TAB 1 ----------------
-with tabs[0]:
-    st.subheader("➕ Nieuw shirt toevoegen")
-    with st.form("add_shirt_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        club = c1.text_input("Club*", "Ajax")
-        seizoen = c2.text_input("Seizoen*", "1995/96")
-        maat = c3.selectbox("Maat*", MAATEN, index=7)
-        x1, x2, x3 = st.columns(3)
-        type_sel = x1.selectbox("Type*", TYPES, index=0)
-        bedrukking = x2.text_input("Bedrukking*", "#10 Speler of 'X'")
-        serienummer = x3.text_input("Serienummer*", "P06358")
-        y1, y2 = st.columns(2)
-        zelf_gekocht = y1.selectbox("Zelf gekocht*", ["Ja","Nee"])
-        aanschaf_prijs = y2.number_input("Aanschaf prijs* (€)", min_value=0.0, step=1.0, format="%.2f")
-        extra_info = st.text_area("Extra informatie", placeholder="BNWT, staat, locatie, etc.")
-        submitted = st.form_submit_button("Toevoegen")
-        if submitted:
-            execute("""INSERT INTO shirts (club,seizoen,type,maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info,status,created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                    (club.strip(), seizoen.strip(), type_sel, maat, bedrukking.strip(), serienummer.strip(), zelf_gekocht, float(aanschaf_prijs), extra_info.strip(), "Actief", datetime.utcnow().isoformat()))
-            st.success("Shirt toegevoegd.")
-
-# ---------------- TAB 2 ----------------
-with tabs[1]:
-    st.subheader("📚 Alle shirts — klik op een rij om de grote foto te tonen")
+with tab1:
     df = load_df("SELECT * FROM shirts")
     if df.empty:
-        st.info("Nog geen shirts.")
+        st.info("Nog geen shirts. Voeg eerst een shirt toe in de database (of importeer).")
     else:
+        # Build view with thumbnails + gallery (as JSON string for JS)
+        thumbs, galleries = [], []
+        for _, r in df.iterrows():
+            photos = get_photos(int(r["id"]))
+            if photos:
+                thumbs.append(to_data_uri(photos[0]["path"]))
+                galleries.append(json.dumps([to_data_uri(p["path"]) for p in photos if to_data_uri(p["path"])]))
+            else:
+                thumbs.append(None)
+                galleries.append(json.dumps([]))
         df_view = df.copy()
-        df_view["seizoen_start"] = df_view["seizoen"].apply(parse_season_start)
-        df_view.sort_values(by=["status","club","seizoen_start","type"], ascending=[True, True, False, True], inplace=True)
-        df_view.drop(columns=["seizoen_start"], inplace=True)
-        df_view["thumb"] = df_view["id"].apply(first_photo_data_uri)
+        df_view["thumb"] = thumbs
+        df_view["gallery_urls"] = galleries
 
-        show_cols = ["thumb","id","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info"]
-        grid_df = df_view[show_cols].copy()
+        show = ["thumb","id","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","gallery_urls"]
+        grid_df = df_view[show].copy()
 
         go = GridOptionsBuilder.from_dataframe(grid_df)
-        # selection by row click (no checkbox)
-        go.configure_selection("single")  # default is row click
-        go.configure_grid_options(domLayout='autoHeight', masterDetail=True, detailRowAutoHeight=True, detailRowHeight=560)
+        go.configure_selection("single")  # row click select
+        go.configure_grid_options(domLayout='autoHeight', masterDetail=True, detailRowAutoHeight=True, detailRowHeight=620)
 
-        # larger thumbnail for visibility
+        # Thumbnail cell
         thumb_renderer = JsCode("""
         class ThumbRenderer {
-          init(params){
+          init(p){
             this.eGui = document.createElement('div');
-            const u = params.value;
+            const u = p.value;
             if (u){
               this.eGui.innerHTML = `<img src="${u}" style="height:56px;border-radius:6px;cursor:pointer" title="Klik voor grote foto">`;
-              this.eGui.addEventListener('click', ()=> params.node.setExpanded(!params.node.expanded));
+              this.eGui.addEventListener('click', ()=> p.node.setExpanded(!p.node.expanded));
             } else {
               this.eGui.innerHTML = `<div style="height:56px;display:flex;align-items:center;color:#bbb">(geen foto)</div>`;
             }
@@ -231,35 +123,86 @@ with tabs[1]:
           getGui(){ return this.eGui; }
         }""")
         go.configure_column("thumb", headerName="Foto", width=120, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=False, cellRenderer=thumb_renderer)
+        go.configure_column("gallery_urls", hide=True)
 
-        # row click toggles detail (and collapses others)
+        # Row click toggles expand and collapses others
         on_row_click = JsCode("""
-        function(params){
-          // collapse others
-          params.api.forEachNode(n => { if (n.master && n !== params.node) n.setExpanded(false); });
-          // toggle clicked
-          if (params.node.master){
-            params.node.setExpanded(!params.node.expanded);
-          }
+        function(p){
+          p.api.forEachNode(n => { if (n.master && n !== p.node) n.setExpanded(false); });
+          if (p.node.master){ p.node.setExpanded(!p.node.expanded); }
         }""")
         go.configure_grid_options(onRowClicked=on_row_click)
 
-        # detail renderer shows large photo(s) inside the row
+        # Detail renderer: big preview in-row + thumbnails + size buttons
         detail_renderer = JsCode("""
         class DetailCellRenderer {
-          init(params){
+          init(p){
             this.eGui = document.createElement('div');
             this.eGui.style.padding = '10px';
-            const id = params.data.id;
-            // The Streamlit side renders uploader below; here we render large preview via data passed in hidden column is not available,
-            // so we rely on a light message; however st-aggrid detail row can host static HTML.
-            // We'll request big image URLs via a data field if present; not available -> instruct user to use pane below.
-            // For simplicity, we place a placeholder; the real big images are shown below via Streamlit selected row panel.
-            const thumb = params.data.thumb;
-            if (thumb){
-              this.eGui.innerHTML = `<img src="${thumb}" style="max-height:70vh;max-width:100%;border-radius:12px"/>`;
-            } else {
-              this.eGui.innerHTML = `<div style="color:#bbb">Geen foto beschikbaar – gebruik het uploadpaneel onder de tabel.</div>`;
+            const gal = JSON.parse(p.data.gallery_urls || "[]");
+            const first = gal.length ? gal[0] : null;
+
+            const wrapper = document.createElement('div');
+            wrapper.style.display = 'grid';
+            wrapper.style.gridTemplateColumns = '1fr';
+            wrapper.style.rowGap = '10px';
+
+            const controls = document.createElement('div');
+            controls.style.display = 'flex';
+            controls.style.justifyContent = 'flex-end';
+            controls.style.gap = '8px';
+
+            const btnS = document.createElement('button');
+            btnS.textContent = 'Klein';
+            const btnM = document.createElement('button');
+            btnM.textContent = 'Groot';
+            const btnL = document.createElement('button');
+            btnL.textContent = 'XL';
+            [btnS,btnM,btnL].forEach(b=>{
+              b.style.cursor='pointer';
+              b.style.padding='4px 8px';
+              b.style.borderRadius='6px';
+              b.style.border='1px solid #444';
+              b.style.background='#222'; b.style.color='#ddd';
+            });
+            controls.appendChild(btnS); controls.appendChild(btnM); controls.appendChild(btnL);
+
+            const big = document.createElement('img');
+            big.style.borderRadius = '12px';
+            big.style.maxWidth = '100%';
+            big.style.height = 'auto';
+            big.style.maxHeight = '60vh';
+            if (first) big.src = first;
+            big.title = 'Klik om te zoomen';
+
+            // Click to toggle zoom
+            big.addEventListener('click', ()=>{
+              if (big.style.maxHeight === '60vh'){ big.style.maxHeight='85vh'; }
+              else { big.style.maxHeight='60vh'; }
+            });
+
+            btnS.onclick = ()=> big.style.maxHeight='40vh';
+            btnM.onclick = ()=> big.style.maxHeight='60vh';
+            btnL.onclick = ()=> big.style.maxHeight='85vh';
+
+            const strip = document.createElement('div');
+            strip.style.display='flex';
+            strip.style.flexWrap='wrap';
+            strip.style.gap='8px';
+            gal.forEach(u=>{
+              const t=document.createElement('img');
+              t.src=u; t.style.height='64px'; t.style.borderRadius='8px'; t.style.cursor='pointer';
+              t.onclick=()=>{ big.src=u; };
+              strip.appendChild(t);
+            });
+
+            if (!first){
+              this.eGui.innerHTML = '<div style="color:#bbb">Geen foto\\'s voor dit shirt. Gebruik het uploadpaneel op tab "Foto\\'s toevoegen bij geselecteerde rij".</div>';
+            }else{
+              wrapper.appendChild(controls);
+              wrapper.appendChild(big);
+              if (gal.length>1){ wrapper.appendChild(strip); }
+              this.eGui.appendChild(wrapper);
             }
           }
           getGui(){ return this.eGui; }
@@ -276,61 +219,41 @@ with tabs[1]:
             enable_enterprise_modules=True
         )
 
-        st.markdown("---")
-        sel = grid["selected_rows"]
-        if not sel:
-            st.info("Klik op een rij om de grote foto in de rij te tonen. Uploaden kan hieronder.")
-        else:
-            rid = int(sel[0]["id"])
-            photos = get_all_photos(rid)
-            with st.expander("📷 Foto's beheren (geselecteerde rij)", expanded=True):
-                if photos:
-                    st.caption("Klik op een foto-link om groot in nieuw tabblad te bekijken.")
-                    for p in photos:
-                        col1, col2 = st.columns([6,1])
-                        with col1:
-                            st.image(p["path"], use_column_width=True)
-                        with col2:
-                            if st.button("🗑️ Verwijder", key=f"del_{rid}_{p['id']}"):
-                                try:
-                                    if os.path.exists(p["path"]):
-                                        os.remove(p["path"])
-                                except Exception:
-                                    pass
-                                execute("DELETE FROM photos WHERE id=?", (p["id"],))
-                                st.experimental_rerun()
-                else:
-                    st.info("Nog geen foto’s bij dit shirt. Voeg ze hieronder toe.")
-
-                up = st.file_uploader("Meerdere foto's kiezen", type=["jpg","jpeg","png"], accept_multiple_files=True, key=f"up_{rid}")
-                if st.button("📥 Upload geselecteerde foto('s')", key=f"btn_up_{rid}"):
-                    if not up:
-                        st.warning("Geen bestanden gekozen.")
-                    else:
-                        n = 0
-                        for uf in up:
-                            path = save_uploaded_file(uf)
-                            if path:
-                                execute("INSERT INTO photos (shirt_id, path, created_at) VALUES (?,?,?)", (rid, path, datetime.utcnow().isoformat()))
-                                n += 1
-                        st.success(f"{n} foto('s) toegevoegd.")
-                        st.experimental_rerun()
-
-# ---------------- TAB 3 ----------------
-with tabs[2]:
-    st.subheader("⭐ Wenslijst & Missende shirts")
-    df_w = load_df("SELECT * FROM wishlist")
-    if not df_w.empty:
-        st.dataframe(df_w, use_container_width=True, hide_index=True)
+with tab2:
+    st.subheader("📷 Foto's toevoegen/verwijderen")
+    all_shirts = load_df("SELECT id, club, seizoen, type FROM shirts ORDER BY club, seizoen DESC, type")
+    if all_shirts.empty:
+        st.info("Nog geen shirts.")
     else:
-        st.info("Nog geen items in de wenslijst.")
+        sel = st.selectbox("Kies een shirt", all_shirts.apply(lambda r: f'ID {r["id"]} — {r["club"]} {r["seizoen"]} • {r["type"]}', axis=1))
+        rid = int(sel.split()[1])
+        photos = get_photos(rid)
+        if photos:
+            st.write("Bestaande foto's:")
+            cols = st.columns(3)
+            for i, p in enumerate(photos):
+                cols[i%3].image(p["path"], use_column_width=True)
+            # delete buttons
+            for p in photos:
+                if st.button(f"🗑️ Verwijder {os.path.basename(p['path'])}", key=f"del_{rid}_{p['id']}"):
+                    try:
+                        if os.path.exists(p["path"]): os.remove(p["path"])
+                    except Exception: pass
+                    execute("DELETE FROM photos WHERE id=?", (p["id"],))
+                    st.experimental_rerun()
+        else:
+            st.info("Nog geen foto's. Upload hieronder.")
 
-# ---------------- TAB 4 ----------------
-with tabs[3]:
-    st.subheader("💸 Verkoop & Budget")
-    st.info("Verkoop/budget functies gelijk aan eerdere versie.")
-
-# ---------------- TAB 5 ----------------
-with tabs[4]:
-    st.subheader("⬇️⬆️ Import / Export")
-    st.info("Import/export functies gelijk aan eerdere versie.")
+        ups = st.file_uploader("Meerdere foto's kiezen", type=["jpg","jpeg","png"], accept_multiple_files=True)
+        if st.button("📥 Upload foto('s)"):
+            if not ups:
+                st.warning("Geen bestanden gekozen.")
+            else:
+                n=0
+                for uf in ups:
+                    path = save_uploaded_file(uf)
+                    if path:
+                        execute("INSERT INTO photos (shirt_id, path, created_at) VALUES (?,?,?)", (rid, path, datetime.utcnow().isoformat()))
+                        n+=1
+                st.success(f"{n} foto('s) toegevoegd.")
+                st.experimental_rerun()
