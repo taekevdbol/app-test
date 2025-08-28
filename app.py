@@ -9,10 +9,12 @@ import os
 DB_PATH = "shirts.db"
 IMAGES_DIR = "images"
 
+# ---------------- DB INIT / MIGRATIONS ----------------
 def init_db():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
+        # Shirts table
         c.execute("""
         CREATE TABLE IF NOT EXISTS shirts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,6 +32,7 @@ def init_db():
             created_at TEXT NOT NULL
         )
         """)
+        # Wishlist
         c.execute("""
         CREATE TABLE IF NOT EXISTS wishlist (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,6 +42,7 @@ def init_db():
             opmerking TEXT
         )
         """)
+        # Sales
         c.execute("""
         CREATE TABLE IF NOT EXISTS sales (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,12 +56,14 @@ def init_db():
             FOREIGN KEY (shirt_id) REFERENCES shirts(id)
         )
         """)
+        # Settings
         c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
         """)
+        # Migrations for existing DBs
         cols = {row[1]: row for row in c.execute("PRAGMA table_info(shirts)").fetchall()}
         if "type" not in cols:
             c.execute("ALTER TABLE shirts ADD COLUMN type TEXT NOT NULL DEFAULT 'Thuis'")
@@ -70,6 +76,7 @@ def init_db():
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+# ---------------- HELPERS ----------------
 def parse_season_start(season_text: str) -> int:
     if not season_text:
         return -1
@@ -123,10 +130,11 @@ def set_setting(key, value):
     else:
         execute("UPDATE settings SET value=? WHERE key=?", (str(value), key))
 
+# ---------------- UI SETUP ----------------
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide", initial_sidebar_state="collapsed")
 init_db()
 
-st.title("⚽ Shirt Collectie — Taeke (v3)")
+st.title("⚽ Shirt Collectie — Taeke (v3.2)")
 
 tabs = st.tabs([
     "➕ Shirt toevoegen",
@@ -140,6 +148,7 @@ tabs = st.tabs([
 TYPES = ["Thuis","Uit","Derde","Keepers","Special"]
 MAATEN = ["Kids XS","Kids S","Kids M","Kids L","XS","S","M","L","XL","XXL","XXXL"]
 
+# ---------------- TAB 1: ADD SHIRT ----------------
 with tabs[0]:
     st.subheader("➕ Nieuw shirt toevoegen")
     with st.form("add_shirt_form", clear_on_submit=True):
@@ -172,44 +181,110 @@ with tabs[0]:
                         (club.strip(), seizoen.strip(), type_sel))
                 st.success("Shirt toegevoegd en eventueel uit de wenslijst verwijderd. 🎉")
 
+# ---------------- TAB 2: COLLECTION (INLINE EDIT) ----------------
 with tabs[1]:
-    st.subheader("📚 Alle shirts (collectie)")
+    st.subheader("📚 Alle shirts (inline bewerken)")
     df = load_df("SELECT * FROM shirts")
     if df.empty:
         st.info("Nog geen shirts in de database. Voeg je eerste shirt toe op het tabblad **Shirt toevoegen**.")
     else:
+        # Filters
         f1, f2, f3, f4, f5, f6 = st.columns(6)
         f_club = f1.text_input("Filter op club")
         f_seizoen = f2.text_input("Filter op seizoen")
         f_type = f3.multiselect("Filter op type", TYPES)
         f_maat = f4.multiselect("Filter op maat", sorted(df["maat"].unique().tolist()))
-        f_zelf = f5.multiselect("Filter op zelf gekocht", ["Ja","Nee"])
+        f_zelf = f5.multiselect("Zelf gekocht", ["Ja","Nee"])
         f_status = f6.multiselect("Status", ["Actief","Verkocht"], default=["Actief","Verkocht"])
 
         mask = pd.Series(True, index=df.index)
-        if f_club:
-            mask &= df["club"].str.contains(f_club, case=False, na=False)
-        if f_seizoen:
-            mask &= df["seizoen"].str.contains(f_seizoen, case=False, na=False)
-        if f_type:
-            mask &= df["type"].isin(f_type)
-        if f_maat:
-            mask &= df["maat"].isin(f_maat)
-        if f_zelf:
-            mask &= df["zelf_gekocht"].isin(f_zelf)
-        if f_status:
-            mask &= df["status"].isin(f_status)
-        df_f = df[mask].copy()
+        if f_club: mask &= df["club"].str.contains(f_club, case=False, na=False)
+        if f_seizoen: mask &= df["seizoen"].str.contains(f_seizoen, case=False, na=False)
+        if f_type: mask &= df["type"].isin(f_type)
+        if f_maat: mask &= df["maat"].isin(f_maat)
+        if f_zelf: mask &= df["zelf_gekocht"].isin(f_zelf)
+        if f_status: mask &= df["status"].isin(f_status)
 
-        df_f["seizoen_start"] = df_f["seizoen"].apply(parse_season_start)
-        df_f.sort_values(by=["status","club","seizoen_start","type"], ascending=[True, True, False, True], inplace=True)
-        df_f.drop(columns=["seizoen_start"], inplace=True)
+        df_view = df[mask].copy()
+        # Sort for display
+        df_view["seizoen_start"] = df_view["seizoen"].apply(parse_season_start)
+        df_view.sort_values(by=["status","club","seizoen_start","type"], ascending=[True, True, False, True], inplace=True)
+        df_view.drop(columns=["seizoen_start"], inplace=True)
 
-        show_cols = ["id","status","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","foto_path","created_at"]
-        st.dataframe(df_f[show_cols], use_container_width=True, hide_index=True)
+        # Choose columns to edit inline
+        edit_cols = ["club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","status"]
+        show_cols = ["id"] + edit_cols + ["foto_path","created_at"]
+
+        df_show = df_view[show_cols].copy()
+
+        edited = st.data_editor(
+            df_show,
+            num_rows="fixed",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "type": st.column_config.SelectboxColumn("Type", options=TYPES),
+                "maat": st.column_config.SelectboxColumn("Maat", options=MAATEN),
+                "zelf_gekocht": st.column_config.SelectboxColumn("Zelf gekocht", options=["Ja","Nee"]),
+                "status": st.column_config.SelectboxColumn("Status", options=["Actief","Verkocht"]),
+                "aanschaf_prijs": st.column_config.NumberColumn("Aanschaf prijs (€)", format="%.2f", step=1.0),
+                "foto_path": st.column_config.TextColumn("Foto-pad (alleen-lezen)", disabled=True),
+                "created_at": st.column_config.TextColumn("Aangemaakt op", disabled=True),
+            }
+        )
+
+        if st.button("💾 Opslaan wijzigingen (alle zichtbare rijen)"):
+            # Compare edited vs original and persist changes
+            changed = 0
+            orig_by_id = df_show.set_index("id")
+            ed_by_id = edited.set_index("id")
+            for row_id, ed_row in ed_by_id.iterrows():
+                if row_id not in orig_by_id.index: 
+                    continue
+                diffs = {}
+                for col in edit_cols:
+                    old = orig_by_id.loc[row_id, col]
+                    new = ed_row[col]
+                    # Normalize NaNs
+                    if pd.isna(old) and pd.isna(new):
+                        continue
+                    if (pd.isna(old) and not pd.isna(new)) or (not pd.isna(old) and pd.isna(new)) or (str(old) != str(new)):
+                        diffs[col] = new
+                if diffs:
+                    # Build update query dynamically
+                    sets = ", ".join([f"{k}=?" for k in diffs.keys()])
+                    params = list(diffs.values()) + [int(row_id)]
+                    execute(f"UPDATE shirts SET {sets} WHERE id=?", params)
+                    changed += 1
+            st.success(f"Wijzigingen opgeslagen voor {changed} rij(en).")
+
+        st.markdown("—")
+        with st.expander("🖼️ Foto bijwerken (optioneel)"):
+            sel_id = st.number_input("Rij-ID om foto te wijzigen", min_value=0, step=1)
+            new_photo = st.file_uploader("Nieuwe foto uploaden (vervangt huidige)", type=["jpg","jpeg","png"], key="row_photo")
+            if st.button("📷 Foto opslaan/verwisselen"):
+                # Get current foto_path
+                if sel_id and (sel_id in df_view["id"].values):
+                    current_path = df_view.loc[df_view["id"]==int(sel_id), "foto_path"].values[0]
+                    if new_photo is None:
+                        st.warning("Geen bestand geselecteerd.")
+                    else:
+                        # remove old file if exists
+                        try:
+                            if current_path and os.path.exists(current_path):
+                                os.remove(current_path)
+                        except Exception:
+                            pass
+                        new_path = save_uploaded_file(new_photo)
+                        execute("UPDATE shirts SET foto_path=? WHERE id=?", (new_path, int(sel_id)))
+                        st.success("Foto bijgewerkt.")
+                        st.experimental_rerun()
+                else:
+                    st.warning("Onbekende ID voor huidige filterselectie.")
 
         with st.expander("🖼️ Toon foto's van gefilterde resultaten"):
-            img_df = df_f.dropna(subset=["foto_path"])
+            img_df = df_view.dropna(subset=["foto_path"])
             if img_df.empty:
                 st.info("Geen foto's beschikbaar voor de huidige selectie.")
             else:
@@ -222,48 +297,7 @@ with tabs[1]:
                             st.image(p, caption=f'{row["club"]} {row["seizoen"]} • {row["type"]} • {row["maat"]}', use_column_width=True)
                         i += 1
 
-        with st.expander("Verwijderen / Bewerken / Status"):
-            colA, colB, colC = st.columns(3)
-            del_id = colA.number_input("Verwijder shirt met ID", min_value=0, step=1)
-            if colA.button("Verwijder", type="primary"):
-                if del_id and int(del_id) in df["id"].values:
-                    path = df.loc[df["id"]==int(del_id), "foto_path"].values[0]
-                    execute("DELETE FROM shirts WHERE id=?", (int(del_id),))
-                    try:
-                        if path and os.path.exists(path):
-                            os.remove(path)
-                    except Exception:
-                        pass
-                    st.success(f"Shirt met ID {int(del_id)} verwijderd.")
-                    st.experimental_rerun()
-                else:
-                    st.warning("Onbekende ID.")
-
-            edit_id = colB.number_input("Bewerk – ID", min_value=0, step=1)
-            new_price = colB.number_input("Nieuwe prijs (€)", min_value=0.0, step=1.0, format="%.2f")
-            new_info  = colB.text_input("Nieuwe extra info")
-            new_type  = colB.selectbox("Nieuw type", ["(geen wijziging)"] + TYPES, index=0)
-            if colB.button("Opslaan wijzigingen"):
-                if edit_id and int(edit_id) in df["id"].values:
-                    current = df[df["id"]==int(edit_id)].iloc[0]
-                    update_type = current["type"] if new_type == "(geen wijziging)" else new_type
-                    execute("UPDATE shirts SET aanschaf_prijs=?, extra_info=?, type=? WHERE id=?",
-                            (float(new_price), new_info, update_type, int(edit_id)))
-                    st.success("Wijzigingen opgeslagen.")
-                    st.experimental_rerun()
-                else:
-                    st.warning("Onbekende ID.")
-
-            status_id = colC.number_input("Zet status (Actief/Verkocht) – ID", min_value=0, step=1)
-            new_status = colC.selectbox("Nieuwe status", ["Actief","Verkocht"])
-            if colC.button("Status bijwerken"):
-                if status_id and int(status_id) in df["id"].values:
-                    execute("UPDATE shirts SET status=? WHERE id=?", (new_status, int(status_id)))
-                    st.success("Status bijgewerkt.")
-                    st.experimental_rerun()
-                else:
-                    st.warning("Onbekende ID.")
-
+# ---------------- TAB 3: WISHLIST & MISSING ----------------
 with tabs[2]:
     st.subheader("⭐ Wenslijst")
     with st.form("add_wish", clear_on_submit=True):
@@ -321,6 +355,7 @@ with tabs[2]:
         else:
             st.dataframe(missing, use_container_width=True, hide_index=True)
 
+# ---------------- TAB 4: SALES & BUDGET ----------------
 with tabs[3]:
     st.subheader("💸 Verkoop & Budget")
     col_b1, col_b2, col_b3 = st.columns(3)
@@ -375,9 +410,12 @@ with tabs[3]:
     else:
         st.dataframe(df_sales, use_container_width=True, hide_index=True)
 
+# ---------------- TAB 5: IMPORT / EXPORT ----------------
 with tabs[4]:
     st.subheader("⬇️⬆️ Import / Export")
+
     col1, col2 = st.columns(2)
+    # Export collection
     df_all = load_df("SELECT * FROM shirts")
     if not df_all.empty:
         export_cols = ["club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","foto_path","status"]
@@ -386,6 +424,7 @@ with tabs[4]:
     else:
         col1.info("Nog geen collectie om te exporteren.")
 
+    # Import collection
     uploaded = col2.file_uploader("Importeer collectie-CSV (kolommen: club,seizoen,type(optional),maat,bedrukking,serienummer,zelf_gekocht,aanschaf_prijs,extra_info)", type=["csv"], key="csv_imp_col")
     if uploaded is not None:
         try:
@@ -423,6 +462,7 @@ with tabs[4]:
 
     st.markdown("---")
     st.subheader("Wenslijst export/import")
+    # Export wishlist
     df_w = load_df("SELECT * FROM wishlist")
     if not df_w.empty:
         wcsv = df_w[["club","seizoen","type","opmerking"]].to_csv(index=False).encode("utf-8")
@@ -430,6 +470,7 @@ with tabs[4]:
     else:
         st.info("Nog geen wenslijst om te exporteren.")
 
+    # Import wishlist
     up_w = st.file_uploader("Importeer wenslijst-CSV (kolommen: club,seizoen,type(optional),opmerking)", type=["csv"], key="csv_imp_wish")
     if up_w is not None:
         try:
@@ -454,13 +495,14 @@ with tabs[4]:
         except Exception as e:
             st.error(f"Import mislukt: {e}")
 
+# ---------------- TAB 6: HELP ----------------
 with tabs[5]:
-    st.subheader("Uitleg & Tips (v3)")
+    st.subheader("Uitleg & Tips (v3.2)")
     st.markdown("""
-**Nieuw in v3**
-- **Wenslijst import/export (CSV)** met kolommen: `club,seizoen,type(optional),opmerking`.
-- **Verkoop & Budget**: registreer verkopen, bereken **winst** (= verkoopprijs − aanschafprijs − kosten) en volg je **totaal** en **budgetdoel**.
-- **Status** bij shirts (Actief/Verkocht) + filters. Verkochte shirts blijven zichtbaar bij **Status=Verkocht**.
+**Nieuw in v3.2**
+- **Inline bewerken**: pas rijen direct aan in **Alle shirts** en klik *💾 Opslaan wijzigingen*.
+- **Foto bijwerken per rij** (onder de tabel) zonder door ID-menu's te gaan.
 
-**Tip:** Gebruik seizoensnotatie `1995/96` of `2009/10` voor perfecte sortering.
+**Overig**
+- Wenslijst import/export, verkopen + budget, foto-galerij, en alle filters blijven gewoon werken.
 """)
