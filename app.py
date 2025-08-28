@@ -12,7 +12,7 @@ from st_aggrid.shared import JsCode
 DB_PATH = "shirts.db"
 IMAGES_DIR = "images"
 
-# ---------------- DB ----------------
+# ---------- DB ----------
 def init_db():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
@@ -51,7 +51,6 @@ def executemany(q, seq):
     with closing(get_conn()) as conn:
         c = conn.cursor(); c.executemany(q, seq); conn.commit()
 
-# ---------------- Helpers ----------------
 def to_data_uri(path):
     if not path or not os.path.exists(path): return None
     mime, _ = mimetypes.guess_type(path)
@@ -97,17 +96,17 @@ def save_uploaded_file(uploaded_file):
     with open(out, "wb") as f: f.write(uploaded_file.getbuffer())
     return out
 
-# ---------------- UI ----------------
+# ---------- UI ----------
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide")
 init_db()
-st.title("⚽ Shirt Collectie — v5.2.7 (compacte inline foto + thumbnails)")
+st.title("⚽ Shirt Collectie — v5.2.8 (scrollbare tabel + kleine inline vergroting)")
 
 TYPES = ["Thuis","Uit","Derde","Keepers","Special"]
 MAATEN = ["Kids XS","Kids S","Kids M","Kids L","XS","S","M","L","XL","XXL","XXXL"]
 
 tabs = st.tabs(["➕ Shirt toevoegen","📚 Collectie (klik foto)","⭐ Wenslijst & Missende shirts","💸 Verkoop & Budget","⬇️⬆️ Import / Export"])
 
-# -------- TAB 1 --------
+# TAB 1
 with tabs[0]:
     st.subheader("➕ Nieuw shirt toevoegen")
     with st.form("add", clear_on_submit=True):
@@ -124,9 +123,9 @@ with tabs[0]:
                     (club.strip(), seizoen.strip(), tsel, maat, bedr.strip(), serie.strip(), zelf, float(prijs), extra.strip(), "Actief", datetime.utcnow().isoformat()))
             st.success("Shirt toegevoegd.")
 
-# -------- TAB 2 --------
+# TAB 2
 with tabs[1]:
-    st.subheader("📚 Klik op de foto (rij wordt kort groter; alles blijft compact)")
+    st.subheader("📚 Klik op de foto (tabel blijft vol in beeld; scrollt indien nodig)")
 
     df = load_df("SELECT * FROM shirts")
     if df.empty:
@@ -158,17 +157,17 @@ with tabs[1]:
 
         go = GridOptionsBuilder.from_dataframe(gdf)
         go.configure_selection("single")
-        go.configure_grid_options(domLayout='autoHeight')
+        # FIX: not autoHeight; table gets a fixed height and scrolls
+        go.configure_grid_options(domLayout='normal')
 
-        # Keep table compact; expanded rows are only 220px
+        # Small expand
         get_row_height = JsCode("""
         function(params){
-          if (params && params.data && params.data._expanded){ return 220; }
+          if (params && params.data && params.data._expanded){ return 160; }
           return 62;
         }""")
         go.configure_grid_options(getRowHeight=get_row_height)
 
-        # Foto renderer: collapsed shows single thumb, expanded shows ALL photos tightly in one row.
         renderer = JsCode("""
         class InlinePhotoRenderer {
           init(p){
@@ -225,7 +224,7 @@ with tabs[1]:
           getGui(){ return this.eGui; }
           refresh(p){ this.params=p; this.rebuild(); return true; }
         }""")
-        go.configure_column("thumb", headerName="Foto", width=200, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=True, cellRenderer=renderer)
+        go.configure_column("thumb", headerName="Foto", width=180, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=True, cellRenderer=renderer)
         go.configure_column("gallery_urls", hide=True)
         go.configure_column("_expanded", hide=True)
 
@@ -233,14 +232,15 @@ with tabs[1]:
             gdf, gridOptions=go.build(),
             update_mode=GridUpdateMode.SELECTION_CHANGED,
             data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-            fit_columns_on_grid_load=True, allow_unsafe_jscode=True, enable_enterprise_modules=True
+            fit_columns_on_grid_load=True, allow_unsafe_jscode=True, enable_enterprise_modules=True,
+            height=560  # fixed height -> grid scrolls; other rows remain visible
         )
 
-        # Compacte foto‑acties (thumbnails + upload), standaard ingeklapt
+        # Small photo actions panel, collapsed by default
         sel = grid["selected_rows"]
         if sel:
             rid = int(sel[0]["id"])
-            with st.expander("📷 Foto‑acties voor geselecteerde rij", expanded=False):
+            with st.expander("📷 Foto‑acties", expanded=False):
                 dfp = load_df("SELECT id, path FROM photos WHERE shirt_id=? ORDER BY id ASC", (rid,))
                 if dfp.empty:
                     st.caption("Nog geen foto's.")
@@ -277,7 +277,7 @@ with tabs[1]:
                                 n+=1
                         st.success(f"{n} foto('s) toegevoegd."); st.experimental_rerun()
 
-# -------- TAB 3 --------
+# TAB 3 (unchanged)
 with tabs[2]:
     st.subheader("⭐ Wenslijst")
     with st.form("add_wish", clear_on_submit=True):
@@ -313,7 +313,7 @@ with tabs[2]:
         else:
             st.success("Alles van je wenslijst zit al in je actieve collectie.")
 
-# -------- TAB 4 --------
+# TAB 4 (unchanged)
 with tabs[3]:
     st.subheader("💸 Verkoop & Budget")
     colA,colB=st.columns([1,2])
@@ -340,7 +340,7 @@ with tabs[3]:
                 execute("UPDATE shirts SET status='Verkocht' WHERE id=?", (int(row["id"]),))
                 st.success(f"Verkoop geregistreerd. Winst: € {winst:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
 
-# -------- TAB 5 --------
+# TAB 5 (import/export)
 with tabs[4]:
     st.subheader("⬇️⬆️ Import / Export")
     col1,col2=st.columns(2)
@@ -356,8 +356,9 @@ with tabs[4]:
         try:
             imp=pd.read_csv(uploaded); lower=[c.lower().strip() for c in imp.columns]
             required=["club","seizoen","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info"]
-            for rc in required:
-                if rc not in lower: st.error(f"Kolom '{rc}' ontbreekt."); st.stop()
+            missing=[rc for rc in required if rc not in lower]
+            if missing:
+                st.error("Ontbrekende kolommen: " + ", ".join(missing)); st.stop()
             colmap={c.lower().strip():c for c in imp.columns}
             type_present="type" in lower; status_present="status" in lower
             rows=[]
