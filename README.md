@@ -1,9 +1,8 @@
-# Shirt Collectie App v3.3 — thumbnails + per-rij foto-expander
-- Foto-thumbnails direct in de tabel via `ImageColumn`.
-- Per-rij expander om foto te bekijken/vervangen/verwijderen (geen losse sectie meer).
-- Inline tekst-edit blijft aanwezig.
+# Shirt Collectie App v3.4 — in-rij uitklappen + verborgen kolommen
+- In de tabel een kolom **Uitklappen (▶/▼)** per rij; bij ▼ verschijnt onderaan een expander met de foto + uploader.
+- Kolommen **Status** en **Aangemaakt op** zijn verborgen in de tabel (filters op status blijven).
 
-## Lokaal starten
+## Lokaal
 ```
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
