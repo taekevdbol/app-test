@@ -4,16 +4,13 @@ import sqlite3
 import pandas as pd
 from contextlib import closing
 from datetime import datetime, date
-import os, base64, json, io
-from PIL import Image
+import os, base64, json
 
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 from st_aggrid.shared import JsCode
 
 DB_PATH = "shirts.db"
 IMAGES_DIR = "images"
-MAX_W, MAX_H = 2000, 2000
-JPEG_QUALITY = 90
 
 def init_db():
     os.makedirs(IMAGES_DIR, exist_ok=True)
@@ -53,28 +50,22 @@ def executemany(q, seq):
     with closing(get_conn()) as conn:
         c = conn.cursor(); c.executemany(q, seq); conn.commit()
 
-def _resize_and_save(image_bytes, dest_path):
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img.thumbnail((MAX_W, MAX_H), Image.LANCZOS)
-    img.save(dest_path, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-
-def save_uploaded_file(uploaded_file):
-    if not uploaded_file: return None
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-    safe = "".join(ch for ch in uploaded_file.name if ch.isalnum() or ch in ("-","_","."," ")).strip().replace(" ","_")
-    out = os.path.join(IMAGES_DIR, f"{ts}_{safe.rsplit('.',1)[0]}.jpg")
-    _resize_and_save(uploaded_file.getbuffer(), out)
-    return out
-
+import mimetypes, base64
 def to_data_uri(path):
     if not path or not os.path.exists(path): return None
+    mime, _ = mimetypes.guess_type(path)
+    if not mime: mime = "image/jpeg"
     with open(path, "rb") as f: b64 = base64.b64encode(f.read()).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
+    return f"data:{mime};base64,{b64}"
 
 def get_photo_data_uris(shirt_id:int):
     rows = load_df("SELECT path FROM photos WHERE shirt_id=? ORDER BY id ASC", (int(shirt_id),))
     if rows.empty: return []
-    return [to_data_uri(p) for p in rows["path"].tolist() if to_data_uri(p)]
+    out=[]
+    for p in rows["path"].tolist():
+        u = to_data_uri(p)
+        if u: out.append(u)
+    return out
 
 def normalize_type(val):
     if val is None or (isinstance(val, float) and pd.isna(val)): return None
@@ -96,15 +87,14 @@ def set_setting(key,val):
     if get_setting(key) is None: execute("INSERT INTO settings (key,value) VALUES (?,?)",(key,str(val)))
     else: execute("UPDATE settings SET value=? WHERE key=?", (str(val), key))
 
-# UI
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide")
 init_db()
-st.title("⚽ Shirt Collectie — v5.2.3 (fotobeheer-blok verwijderd)")
+st.title("⚽ Shirt Collectie — v5.2.4 (klik‑om‑te‑vergroten in dezelfde rij)")
 
 TYPES = ["Thuis","Uit","Derde","Keepers","Special"]
 MAATEN = ["Kids XS","Kids S","Kids M","Kids L","XS","S","M","L","XL","XXL","XXXL"]
 
-tabs = st.tabs(["➕ Shirt toevoegen","📚 Collectie (klik rij/thumbnail)","⭐ Wenslijst & Missende shirts","💸 Verkoop & Budget","⬇️⬆️ Import / Export"])
+tabs = st.tabs(["➕ Shirt toevoegen","📚 Collectie (klik foto)","⭐ Wenslijst & Missende shirts","💸 Verkoop & Budget","⬇️⬆️ Import / Export"])
 
 with tabs[0]:
     st.subheader("➕ Nieuw shirt toevoegen")
@@ -123,8 +113,8 @@ with tabs[0]:
             st.success("Shirt toegevoegd.")
 
 with tabs[1]:
-    st.subheader("📚 Alle shirts — klik rij/thumbnail voor grote foto")
-    fallback = st.toggle("Veilige fotomodus (fallback)", value=False)
+    st.subheader("📚 Klik op de foto (zelfde rij wordt hoger; andere rijen schuiven omlaag)")
+
     df = load_df("SELECT * FROM shirts")
     if df.empty:
         st.info("Nog geen shirts.")
@@ -147,73 +137,59 @@ with tabs[1]:
             imgs = get_photo_data_uris(int(r["id"]))
             thumbs.append(imgs[0] if imgs else None); galleries.append(json.dumps(imgs))
         dfv["thumb"]=thumbs; dfv["gallery_urls"]=galleries
+        dfv["_expanded"] = False
 
-        show = ["thumb","id","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","gallery_urls"]
+        show = ["thumb","id","club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","gallery_urls","_expanded"]
         gdf = dfv[show].copy()
 
         go = GridOptionsBuilder.from_dataframe(gdf)
         go.configure_selection("single")
-        if not fallback:
-            go.configure_grid_options(domLayout='autoHeight', masterDetail=True, detailRowAutoHeight=True, detailRowHeight=700)
-        else:
-            go.configure_grid_options(domLayout='autoHeight')
+        go.configure_grid_options(domLayout='autoHeight')
 
-        thumb = JsCode("""
-        class ThumbRenderer {
+        # Set dynamic row height based on _expanded
+        get_row_height = JsCode("""
+        function(params){
+          if (params && params.data && params.data._expanded){ return 420; }
+          return 62;
+        }""")
+        go.configure_grid_options(getRowHeight=get_row_height)
+
+        # Inline renderer that toggles expanded and resizes row
+        renderer = JsCode("""
+        class InlinePhotoRenderer {
           init(p){
-            this.eGui=document.createElement('div');
-            const u=p.value;
-            if(u){ this.eGui.innerHTML=`<img src="${u}" style="height:56px;border-radius:6px;cursor:pointer">`; this.eGui.addEventListener('click',()=>{ if(p.node.master) p.node.setExpanded(!p.node.expanded); }); }
-            else{ this.eGui.innerHTML=`<div style="height:56px;display:flex;align-items:center;color:#bbb">(geen foto)</div>`; }
+            this.params=p;
+            const gal = JSON.parse(p.data.gallery_urls || "[]");
+            const first = gal.length ? gal[0] : null;
+
+            this.eGui = document.createElement('div');
+            this.eGui.style.height='100%';
+            this.eGui.style.display='flex';
+            this.eGui.style.alignItems='center';
+            this.eGui.style.justifyContent='center';
+            this.eGui.style.overflow='hidden';
+            this.eGui.style.cursor='pointer';
+
+            const img = document.createElement('img');
+            img.style.maxHeight='100%';
+            img.style.maxWidth='100%';
+            img.style.objectFit='contain';
+            if(first) img.src = first;
+            this.eGui.appendChild(img);
+
+            this.eGui.addEventListener('click', ()=>{
+               // toggle expanded flag on this row
+               p.node.data._expanded = !p.node.data._expanded;
+               p.api.resetRowHeights();
+            });
           }
           getGui(){ return this.eGui; }
+          refresh(p){ this.params=p; return true; }
         }""")
-        go.configure_column("thumb", headerName="Foto", width=120, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=False, cellRenderer=thumb)
+
+        go.configure_column("thumb", headerName="Foto", width=260, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=True, cellRenderer=renderer)
         go.configure_column("gallery_urls", hide=True)
-
-        if not fallback:
-            on_click = JsCode("""
-            function(p){
-              p.api.forEachNode(n=>{ if(n.master && n!==p.node) n.setExpanded(false); });
-              if(p.node.master) p.node.setExpanded(!p.node.expanded);
-            }""")
-            go.configure_grid_options(onRowClicked=on_click)
-
-            detail = JsCode("""
-            class DetailCellRenderer{
-              init(p){
-                this.eGui=document.createElement('div'); this.eGui.style.padding='10px';
-                const gal = JSON.parse(p.data.gallery_urls||"[]"); const first = gal.length?gal[0]:null;
-                const wrap=document.createElement('div'); wrap.style.display='grid'; wrap.style.gridTemplateColumns='1fr'; wrap.style.rowGap='10px';
-
-                const controls=document.createElement('div'); controls.style.display='flex'; controls.style.justifyContent='space-between'; controls.style.gap='8px';
-                const left=document.createElement('div'); left.style.display='flex'; left.style.gap='8px';
-                const mk=(t)=>{const b=document.createElement('button'); b.textContent=t; b.style.padding='4px 8px'; b.style.borderRadius='6px'; b.style.border='1px solid #444'; b.style.background='#222'; b.style.color='#ddd'; b.style.cursor='pointer'; return b;};
-                const bS=mk('Klein'), bM=mk('Groot'), bL=mk('XL'); left.appendChild(bS); left.appendChild(bM); left.appendChild(bL);
-                const right=document.createElement('div'); const bFS=mk('Volledig scherm'); right.appendChild(bFS);
-                controls.appendChild(left); controls.appendChild(right);
-
-                const frame=document.createElement('div');
-                frame.style.height='60vh'; frame.style.overflow='hidden'; frame.style.display='flex'; frame.style.alignItems='center'; frame.style.justifyContent='center'; frame.style.borderRadius='12px'; frame.style.background='#111';
-                const big=document.createElement('img'); big.style.maxWidth='100%'; big.style.maxHeight='100%'; big.style.objectFit='contain'; if(first) big.src=first;
-                bS.onclick=()=>{frame.style.height='40vh'}; bM.onclick=()=>{frame.style.height='60vh'}; bL.onclick=()=>{frame.style.height='85vh'};
-
-                const overlay=document.createElement('div'); overlay.style.position='fixed'; overlay.style.left='0'; overlay.style.top='0'; overlay.style.width='100vw'; overlay.style.height='100vh'; overlay.style.background='rgba(0,0,0,0.95)'; overlay.style.display='none'; overlay.style.zIndex='99999'; overlay.style.alignItems='center'; overlay.style.justifyContent='center';
-                const fs=document.createElement('img'); fs.style.maxWidth='95vw'; fs.style.maxHeight='95vh'; fs.style.objectFit='contain'; overlay.appendChild(fs);
-                overlay.addEventListener('click',()=>{overlay.style.display='none'}); window.addEventListener('keydown',(e)=>{if(e.key==='Escape') overlay.style.display='none'});
-                this.eGui.appendChild(overlay); bFS.onclick=()=>{fs.src=big.src; overlay.style.display='flex'};
-
-                frame.appendChild(big);
-
-                const strip=document.createElement('div'); strip.style.display='flex'; strip.style.flexWrap='wrap'; strip.style.gap='8px';
-                gal.forEach(u=>{ const t=document.createElement('img'); t.src=u; t.style.height='64px'; t.style.borderRadius='8px'; t.style.cursor='pointer'; t.onclick=()=>{big.src=u}; strip.appendChild(t); });
-
-                if(!first){ this.eGui.innerHTML=`<div style="color:#bbb">Geen foto's bij dit shirt.</div>`; }
-                else{ wrap.appendChild(controls); wrap.appendChild(frame); if(gal.length>1) wrap.appendChild(strip); this.eGui.appendChild(wrap); }
-              }
-              getGui(){return this.eGui;}
-            }""")
-            go.configure_grid_options(detailCellRenderer=detail)
+        go.configure_column("_expanded", hide=True)
 
         grid = AgGrid(
             gdf, gridOptions=go.build(),
