@@ -134,7 +134,7 @@ def set_setting(key, value):
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide", initial_sidebar_state="collapsed")
 init_db()
 
-st.title("⚽ Shirt Collectie — Taeke (v3.2)")
+st.title("⚽ Shirt Collectie — Taeke (v3.3)")
 
 tabs = st.tabs([
     "➕ Shirt toevoegen",
@@ -181,9 +181,9 @@ with tabs[0]:
                         (club.strip(), seizoen.strip(), type_sel))
                 st.success("Shirt toegevoegd en eventueel uit de wenslijst verwijderd. 🎉")
 
-# ---------------- TAB 2: COLLECTION (INLINE EDIT) ----------------
+# ---------------- TAB 2: COLLECTION (INLINE EDIT + PER-ROW EXPANDER) ----------------
 with tabs[1]:
-    st.subheader("📚 Alle shirts (inline bewerken)")
+    st.subheader("📚 Alle shirts (inline bewerken + foto per rij)")
     df = load_df("SELECT * FROM shirts")
     if df.empty:
         st.info("Nog geen shirts in de database. Voeg je eerste shirt toe op het tabblad **Shirt toevoegen**.")
@@ -211,9 +211,16 @@ with tabs[1]:
         df_view.sort_values(by=["status","club","seizoen_start","type"], ascending=[True, True, False, True], inplace=True)
         df_view.drop(columns=["seizoen_start"], inplace=True)
 
+        # Thumbnails for table
+        def thumb(path):
+            if path and os.path.exists(path):
+                return path
+            return None
+        df_view["foto_thumb"] = df_view["foto_path"].apply(thumb)
+
         # Choose columns to edit inline
         edit_cols = ["club","seizoen","type","maat","bedrukking","serienummer","zelf_gekocht","aanschaf_prijs","extra_info","status"]
-        show_cols = ["id"] + edit_cols + ["foto_path","created_at"]
+        show_cols = ["id","foto_thumb"] + edit_cols + ["created_at"]
 
         df_show = df_view[show_cols].copy()
 
@@ -223,19 +230,18 @@ with tabs[1]:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "id": st.column_config.NumberColumn("ID", disabled=True, help="Rij ID"),
+                "foto_thumb": st.column_config.ImageColumn("Foto", help="Klik op de rij hieronder om foto te bekijken/wijzigen", width="small"),
                 "type": st.column_config.SelectboxColumn("Type", options=TYPES),
                 "maat": st.column_config.SelectboxColumn("Maat", options=MAATEN),
                 "zelf_gekocht": st.column_config.SelectboxColumn("Zelf gekocht", options=["Ja","Nee"]),
                 "status": st.column_config.SelectboxColumn("Status", options=["Actief","Verkocht"]),
                 "aanschaf_prijs": st.column_config.NumberColumn("Aanschaf prijs (€)", format="%.2f", step=1.0),
-                "foto_path": st.column_config.TextColumn("Foto-pad (alleen-lezen)", disabled=True),
                 "created_at": st.column_config.TextColumn("Aangemaakt op", disabled=True),
             }
         )
 
         if st.button("💾 Opslaan wijzigingen (alle zichtbare rijen)"):
-            # Compare edited vs original and persist changes
             changed = 0
             orig_by_id = df_show.set_index("id")
             ed_by_id = edited.set_index("id")
@@ -252,50 +258,56 @@ with tabs[1]:
                     if (pd.isna(old) and not pd.isna(new)) or (not pd.isna(old) and pd.isna(new)) or (str(old) != str(new)):
                         diffs[col] = new
                 if diffs:
-                    # Build update query dynamically
                     sets = ", ".join([f"{k}=?" for k in diffs.keys()])
                     params = list(diffs.values()) + [int(row_id)]
                     execute(f"UPDATE shirts SET {sets} WHERE id=?", params)
                     changed += 1
             st.success(f"Wijzigingen opgeslagen voor {changed} rij(en).")
 
-        st.markdown("—")
-        with st.expander("🖼️ Foto bijwerken (optioneel)"):
-            sel_id = st.number_input("Rij-ID om foto te wijzigen", min_value=0, step=1)
-            new_photo = st.file_uploader("Nieuwe foto uploaden (vervangt huidige)", type=["jpg","jpeg","png"], key="row_photo")
-            if st.button("📷 Foto opslaan/verwisselen"):
-                # Get current foto_path
-                if sel_id and (sel_id in df_view["id"].values):
-                    current_path = df_view.loc[df_view["id"]==int(sel_id), "foto_path"].values[0]
-                    if new_photo is None:
-                        st.warning("Geen bestand geselecteerd.")
-                    else:
-                        # remove old file if exists
+        st.markdown("---")
+        st.subheader("Details & foto per rij")
+        # Per-row expander with current photo + uploader
+        for _, row in df_view.iterrows():
+            header = f'ID {row["id"]} — {row["club"]} {row["seizoen"]} • {row["type"]} • {row["maat"]}'
+            with st.expander(header):
+                # Show current photo
+                if row["foto_path"] and os.path.exists(row["foto_path"]):
+                    st.image(row["foto_path"], caption=f'{row["club"]} {row["seizoen"]}', use_column_width=True)
+                    colp1, colp2 = st.columns([1,1])
+                    # Replace photo
+                    new_photo = colp1.file_uploader("Vervang foto", type=["jpg","jpeg","png"], key=f"upl_{row['id']}")
+                    if colp1.button("📷 Opslaan nieuwe foto", key=f"save_{row['id']}"):
+                        if new_photo is None:
+                            st.warning("Geen bestand gekozen.")
+                        else:
+                            # remove old
+                            try:
+                                if os.path.exists(row["foto_path"]):
+                                    os.remove(row["foto_path"])
+                            except Exception:
+                                pass
+                            new_path = save_uploaded_file(new_photo)
+                            execute("UPDATE shirts SET foto_path=? WHERE id=?", (new_path, int(row["id"])))
+                            st.success("Foto vervangen. Herlaad de pagina om de wijziging te zien.")
+                    # Delete photo
+                    if colp2.button("🗑️ Verwijder foto", key=f"del_{row['id']}"):
                         try:
-                            if current_path and os.path.exists(current_path):
-                                os.remove(current_path)
+                            if os.path.exists(row["foto_path"]):
+                                os.remove(row["foto_path"])
                         except Exception:
                             pass
-                        new_path = save_uploaded_file(new_photo)
-                        execute("UPDATE shirts SET foto_path=? WHERE id=?", (new_path, int(sel_id)))
-                        st.success("Foto bijgewerkt.")
-                        st.experimental_rerun()
+                        execute("UPDATE shirts SET foto_path=NULL WHERE id=?", (int(row["id"]),))
+                        st.success("Foto verwijderd. Herlaad de pagina om de wijziging te zien.")
                 else:
-                    st.warning("Onbekende ID voor huidige filterselectie.")
-
-        with st.expander("🖼️ Toon foto's van gefilterde resultaten"):
-            img_df = df_view.dropna(subset=["foto_path"])
-            if img_df.empty:
-                st.info("Geen foto's beschikbaar voor de huidige selectie.")
-            else:
-                cols = st.columns(4)
-                i = 0
-                for _, row in img_df.iterrows():
-                    p = row["foto_path"]
-                    if p and os.path.exists(p):
-                        with cols[i % 4]:
-                            st.image(p, caption=f'{row["club"]} {row["seizoen"]} • {row["type"]} • {row["maat"]}', use_column_width=True)
-                        i += 1
+                    st.info("Nog geen foto opgeslagen voor dit shirt.")
+                    new_photo2 = st.file_uploader("Foto toevoegen", type=["jpg","jpeg","png"], key=f"upl_add_{row['id']}")
+                    if st.button("📷 Foto opslaan", key=f"save_add_{row['id']}"):
+                        if new_photo2 is None:
+                            st.warning("Geen bestand gekozen.")
+                        else:
+                            new_path = save_uploaded_file(new_photo2)
+                            execute("UPDATE shirts SET foto_path=? WHERE id=?", (new_path, int(row["id"])))
+                            st.success("Foto opgeslagen. Herlaad de pagina om de wijziging te zien.")
 
 # ---------------- TAB 3: WISHLIST & MISSING ----------------
 with tabs[2]:
@@ -497,12 +509,13 @@ with tabs[4]:
 
 # ---------------- TAB 6: HELP ----------------
 with tabs[5]:
-    st.subheader("Uitleg & Tips (v3.2)")
+    st.subheader("Uitleg & Tips (v3.3)")
     st.markdown("""
-**Nieuw in v3.2**
-- **Inline bewerken**: pas rijen direct aan in **Alle shirts** en klik *💾 Opslaan wijzigingen*.
-- **Foto bijwerken per rij** (onder de tabel) zonder door ID-menu's te gaan.
+**Nieuw in v3.3**
+- **Thumbnail-kolom** in de tabel, zodat je een mini-foto per rij ziet.
+- **Per-rij uitklappen** (*Details & foto per rij*) om direct de foto te bekijken/vervangen/verwijderen.
+- Tekstvelden blijven **inline** bewerkbaar en sla je in één keer op met *💾 Opslaan wijzigingen*.
 
 **Overig**
-- Wenslijst import/export, verkopen + budget, foto-galerij, en alle filters blijven gewoon werken.
+- Wenslijst import/export, verkopen + budget, en alle filters blijven werken.
 """)

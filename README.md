@@ -1,9 +1,9 @@
-# Shirt Collectie App v3.2 — inline editing
-- Inline edits via `st.data_editor` met selectboxen voor type/maat/status en Ja/Nee.
-- Foto per rij bijwerken via uploader.
-- Overige functies (wishlist import/export, sales & budget) blijven werken.
+# Shirt Collectie App v3.3 — thumbnails + per-rij foto-expander
+- Foto-thumbnails direct in de tabel via `ImageColumn`.
+- Per-rij expander om foto te bekijken/vervangen/verwijderen (geen losse sectie meer).
+- Inline tekst-edit blijft aanwezig.
 
-## Run lokaal
+## Lokaal starten
 ```
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -12,7 +12,7 @@ streamlit run app.py
 ```
 
 ## Streamlit Cloud
-Zet `runtime.txt` met:
+Plaats `runtime.txt` met:
 ```
 python-3.12
 ```
