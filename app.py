@@ -100,7 +100,7 @@ def save_uploaded_file(uploaded_file):
 # ---------------- UI ----------------
 st.set_page_config(page_title="Shirt Collectie", page_icon="🧺", layout="wide")
 init_db()
-st.title("⚽ Shirt Collectie — v5.2.5 (inline vergroten + snelle foto‑acties)")
+st.title("⚽ Shirt Collectie — v5.2.7 (compacte inline foto + thumbnails)")
 
 TYPES = ["Thuis","Uit","Derde","Keepers","Special"]
 MAATEN = ["Kids XS","Kids S","Kids M","Kids L","XS","S","M","L","XL","XXL","XXXL"]
@@ -126,7 +126,7 @@ with tabs[0]:
 
 # -------- TAB 2 --------
 with tabs[1]:
-    st.subheader("📚 Klik op de foto (zelfde rij wordt hoger; andere rijen schuiven mee)")
+    st.subheader("📚 Klik op de foto (rij wordt kort groter; alles blijft compact)")
 
     df = load_df("SELECT * FROM shirts")
     if df.empty:
@@ -160,31 +160,72 @@ with tabs[1]:
         go.configure_selection("single")
         go.configure_grid_options(domLayout='autoHeight')
 
+        # Keep table compact; expanded rows are only 220px
         get_row_height = JsCode("""
         function(params){
-          if (params && params.data && params.data._expanded){ return 420; }
+          if (params && params.data && params.data._expanded){ return 220; }
           return 62;
         }""")
         go.configure_grid_options(getRowHeight=get_row_height)
 
+        # Foto renderer: collapsed shows single thumb, expanded shows ALL photos tightly in one row.
         renderer = JsCode("""
         class InlinePhotoRenderer {
           init(p){
-            const gal = JSON.parse(p.data.gallery_urls || "[]");
-            const first = gal.length ? gal[0] : null;
+            this.params=p;
             this.eGui = document.createElement('div');
-            this.eGui.style.height='100%'; this.eGui.style.display='flex';
-            this.eGui.style.alignItems='center'; this.eGui.style.justifyContent='center';
-            this.eGui.style.overflow='hidden'; this.eGui.style.cursor='pointer';
-            const img = document.createElement('img');
-            img.style.maxHeight='100%'; img.style.maxWidth='100%'; img.style.objectFit='contain';
-            if(first) img.src = first; this.eGui.appendChild(img);
-            this.eGui.addEventListener('click', ()=>{ p.node.data._expanded = !p.node.data._expanded; p.api.resetRowHeights(); });
+            this.eGui.style.height='100%';
+            this.eGui.style.width='100%';
+            this.eGui.style.overflow='hidden';
+            this.eGui.style.cursor='pointer';
+            this.rebuild();
+            this.eGui.addEventListener('click', ()=>{
+               p.node.data._expanded = !p.node.data._expanded;
+               this.rebuild();
+               p.api.resetRowHeights();
+            });
+          }
+          rebuild(){
+            const p=this.params;
+            const gal = JSON.parse(p.data.gallery_urls || "[]");
+            this.eGui.innerHTML='';
+            if (!p.data._expanded){
+               const wrap = document.createElement('div');
+               wrap.style.display='flex'; wrap.style.alignItems='center';
+               wrap.style.height='100%'; wrap.style.padding='0';
+               if (gal.length){
+                 const img=document.createElement('img');
+                 img.src=gal[0];
+                 img.style.height='56px'; img.style.objectFit='contain'; img.style.borderRadius='6px';
+                 wrap.appendChild(img);
+               } else {
+                 const ph=document.createElement('div');
+                 ph.textContent='(geen foto)'; ph.style.color='#bbb'; ph.style.fontSize='12px';
+                 wrap.appendChild(ph);
+               }
+               this.eGui.appendChild(wrap);
+            } else {
+               const strip=document.createElement('div');
+               strip.style.height='100%'; strip.style.display='flex';
+               strip.style.alignItems='center'; strip.style.gap='6px';
+               strip.style.padding='0'; strip.style.overflowX='auto';
+               gal.forEach(u=>{
+                 const im=document.createElement('img');
+                 im.src=u; im.style.height='100%'; im.style.objectFit='contain'; im.style.borderRadius='6px';
+                 strip.appendChild(im);
+               });
+               if (gal.length===0){
+                 const ph=document.createElement('div');
+                 ph.textContent='(geen foto)'; ph.style.color='#bbb'; ph.style.fontSize='12px';
+                 strip.appendChild(ph);
+               }
+               this.eGui.appendChild(strip);
+            }
           }
           getGui(){ return this.eGui; }
-          refresh(p){ return true; }
+          refresh(p){ this.params=p; this.rebuild(); return true; }
         }""")
-        go.configure_column("thumb", headerName="Foto", width=260, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=True, cellRenderer=renderer)
+        go.configure_column("thumb", headerName="Foto", width=200, pinned="left", suppressMenu=True, sortable=False, filter=False, resizable=True, cellRenderer=renderer)
         go.configure_column("gallery_urls", hide=True)
         go.configure_column("_expanded", hide=True)
 
@@ -195,30 +236,36 @@ with tabs[1]:
             fit_columns_on_grid_load=True, allow_unsafe_jscode=True, enable_enterprise_modules=True
         )
 
-        # Snelle foto‑acties (compact paneel) – verschijnt alleen als een rij is geselecteerd
+        # Compacte foto‑acties (thumbnails + upload), standaard ingeklapt
         sel = grid["selected_rows"]
         if sel:
             rid = int(sel[0]["id"])
-            with st.expander("📷 Foto‑acties voor geselecteerde rij", expanded=True):
-                cA, cB = st.columns([2,1])
-                # thumbnails + delete
+            with st.expander("📷 Foto‑acties voor geselecteerde rij", expanded=False):
                 dfp = load_df("SELECT id, path FROM photos WHERE shirt_id=? ORDER BY id ASC", (rid,))
                 if dfp.empty:
-                    cA.info("Nog geen foto's voor dit shirt.")
+                    st.caption("Nog geen foto's.")
                 else:
-                    for row in dfp.to_dict('records'):
-                        c = cA.container()
-                        c.image(row["path"], use_column_width=True)
-                        if c.button(f"🗑️ Verwijder", key=f"del_{rid}_{row['id']}"):
-                            try:
-                                if os.path.exists(row["path"]): os.remove(row["path"])
-                            except Exception:
-                                pass
-                            execute("DELETE FROM photos WHERE id=?", (row["id"],))
-                            st.experimental_rerun()
-                # uploader
-                ups = cB.file_uploader("Nieuwe foto('s)", type=["jpg","jpeg","png"], accept_multiple_files=True, key=f"up_{rid}")
-                if cB.button("📥 Upload", key=f"btn_up_{rid}"):
+                    thumbs = dfp.to_dict('records')
+                    per_row = 8
+                    rows = (len(thumbs)+per_row-1)//per_row
+                    idx=0
+                    for _ in range(rows):
+                        cols = st.columns(per_row)
+                        for i in range(per_row):
+                            if idx>=len(thumbs): break
+                            with cols[i]:
+                                st.image(thumbs[idx]["path"], width=96)
+                                if st.button("🗑️", key=f"del_{rid}_{thumbs[idx]['id']}"):
+                                    try:
+                                        if os.path.exists(thumbs[idx]["path"]):
+                                            os.remove(thumbs[idx]["path"])
+                                    except Exception:
+                                        pass
+                                    execute("DELETE FROM photos WHERE id=?", (thumbs[idx]["id"],))
+                                    st.experimental_rerun()
+                            idx+=1
+                ups = st.file_uploader("Nieuwe foto('s)", type=["jpg","jpeg","png"], accept_multiple_files=True, key=f"up_{rid}")
+                if st.button("📥 Upload", key=f"btn_up_{rid}"):
                     if not ups:
                         st.warning("Geen bestanden gekozen.")
                     else:
